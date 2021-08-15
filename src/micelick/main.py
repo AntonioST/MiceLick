@@ -2,7 +2,7 @@ import logging
 import os.path
 import sys
 import time
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import cv2
 import numpy as np
@@ -20,10 +20,19 @@ COLOR_YELLOW = (0, 255, 255)
 COLOR_GREEN = (0, 255, 0)
 COLOR_BLUE = (255, 0, 0)
 COLOR_WHITE = (0, 0, 0)
+COLOR_BLACK = (255, 255, 255)
 
 
-def calculate_value(video, mask: np.ndarray) -> np.ndarray:
-    pass
+def rectangle_to_mask(w: int, h: int, roi: np.ndarray) -> np.ndarray:
+    ret = np.zeros((h, w, 3), dtype=np.uint8)
+    _, x0, y0, x1, y1 = roi
+    cv2.rectangle(ret, (x0, y0), (x1, y1), COLOR_BLACK, -1, cv2.LINE_AA)
+    return ret
+
+
+def calculate_value(image: np.ndarray, mask: np.ndarray) -> float:
+    img = cv2.cvtColor(cv2.bitwise_and(image, mask), cv2.COLOR_BGR2GRAY)
+    return np.mean(img)
 
 
 def calculate_licking(t: np.ndarray, value: np.ndarray) -> np.ndarray:
@@ -49,12 +58,18 @@ class Main:
         self.roi_use_file: Optional[str] = None
         self.roi_output_file: Optional[str] = None
 
-        # property
+        # lick properties
+        self.current_value = 0
+        self.lick_possibility: np.ndarray = None
+
+        # display properties
         self.window_title = 'MouseLicking'
-        self.mask: np.ndarray = np.zeros((0, 5), dtype=int)
+        self.roi: np.ndarray = np.zeros((0, 5), dtype=int)
         self.show_time = True
-        self.show_mask = True
-        self.mouse_stick_to_mask = True
+        self.show_lick = True
+        self.show_lick_duration = 30
+        self.show_roi = True
+        self.mouse_stick_to_roi = True
         self.mouse_stick_distance = 5
         self.message_fade_time = 5
 
@@ -72,10 +87,10 @@ class Main:
         self._sleep_interval = 1
         self._is_playing = False
         self._current_operation_state = self.MOUSE_STATE_FREE
-        self._current_mouse_hover_frame = None
-        self._current_mouse_button = None
-        self._current_masking_region = None
-        self._message_queue = []
+        self._current_mouse_hover_frame: Optional[int] = None
+        self._current_roi_region: List[int] = None
+        self._message_queue: List[Tuple[float, str]] = []
+        self._mask_cache: Optional[Tuple[int, np.ndarray]] = None
         self.buffer = ''
 
     @property
@@ -123,58 +138,58 @@ class Main:
         self._message_queue.append((time.time(), text))
 
     @property
-    def mask_count(self) -> int:
-        return self.mask.shape[0]
+    def roi_count(self) -> int:
+        return self.roi.shape[0]
 
     @property
-    def current_mask(self) -> Optional[np.ndarray]:
-        f = self.current_frame
+    def current_roi(self) -> Optional[np.ndarray]:
+        return self.get_roi(self.current_frame)
+
+    def get_roi(self, frame: int) -> Optional[np.ndarray]:
         ret = None
-        for mask in self.mask:
+        for mask in self.roi:
             t = mask[0]
-            if t < f:
+            if t <= frame:
                 ret = mask
         return ret
 
-    def add_mask(self, x0: int, y0: int, x1: int, y1: int, t: int = None):
+    def add_roi(self, x0: int, y0: int, x1: int, y1: int, t: int = None):
         if t is None:
             t = self.current_frame
 
-        self.mask = np.sort(np.append(self.mask, [(t, x0, y0, x1, y1)], axis=0), axis=0)
-        LOGGER.info(f'add mask [{t},{x0},{y0},{x1},{y1}]')
+        i = np.nonzero(self.roi[:, 0] == t)[0]
+        if len(i) == 0:
+            self.roi = np.sort(np.append(self.roi, [(t, x0, y0, x1, y1)], axis=0), axis=0)
+        else:
+            self.roi[i[0]] = (t, x0, y0, x1, y1)
+        LOGGER.info(f'add roi [{t},{x0},{y0},{x1},{y1}]')
 
-    def del_mask(self, index: int):
-        t, x0, y0, x1, y1 = self.mask[index]
-        self.mask = np.delete(self.mask, index, axis=0)
-        LOGGER.info(f'del mask [{t},{x0},{y0},{x1},{y1}]')
+    def del_roi(self, index: int):
+        t, x0, y0, x1, y1 = self.roi[index]
+        self.roi = np.delete(self.roi, index, axis=0)
+        LOGGER.info(f'del roi [{t},{x0},{y0},{x1},{y1}]')
 
-    def clear_mask(self):
-        self.mask = np.zeros((0, 5), dtype=int)
+    def clear_roi(self):
+        self.roi = np.zeros((0, 5), dtype=int)
 
-    def load_mask(self, file: str):
+    def load_roi(self, file: str):
         LOGGER.debug(f'load mask = {file}')
         ret: np.ndarray = np.load(file)
         # shape: (N, (time, x, y, width, height))
         if not (ret.ndim == 2 and ret.shape[1] == 5):
             raise RuntimeError('not a roi mask')
-        self.mask = ret
+        self.roi = ret
 
-    def save_mask(self, file: str):
-        np.save(file, self.mask)
+    def save_roi(self, file: str):
+        np.save(file, self.roi)
+
+    def _get_mask_cache(self, roi: np.ndarray) -> np.ndarray:
+        if self._mask_cache is None or self._mask_cache[0] != roi[0]:
+            self._mask_cache = (roi[0], rectangle_to_mask(self.video_width, self.video_height, roi))
+        return self._mask_cache[1]
 
     def start(self, pause_on_start=False):
-        LOGGER.debug(f'file = {self.video_file}')
-        self.video_capture = vc = cv2.VideoCapture(self.video_file)
-        self.video_width = w = int(vc.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.video_height = h = int(vc.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        LOGGER.debug(f'width,height = {w},{h}')
-
-        self.video_fps = fps = int(vc.get(cv2.CAP_PROP_FPS))
-        LOGGER.debug(f'fps = {fps}')
-        self.speed_factor = self._speed_factor  # update sleep_interval
-
-        self.video_total_frames = f = int(vc.get(cv2.CAP_PROP_FRAME_COUNT))
-        LOGGER.debug(f'total_frame = {f}')
+        vc = self._init_video()
 
         cv2.namedWindow(self.window_title, cv2.WINDOW_GUI_NORMAL)
         cv2.setMouseCallback(self.window_title, self.handle_mouse_event)
@@ -188,8 +203,37 @@ class Main:
             vc.release()
             cv2.destroyWindow(self.window_title)
 
+    def start_no_gui(self):
+        vc = self._init_video()
+
+        try:
+            pass
+        except KeyboardInterrupt:
+            pass
+        finally:
+            vc.release()
+
+    def _init_video(self) -> cv2.VideoCapture:
+        LOGGER.debug(f'file = {self.video_file}')
+        self.video_capture = vc = cv2.VideoCapture(self.video_file)
+        self.video_width = w = int(vc.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.video_height = h = int(vc.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        LOGGER.debug(f'width,height = {w},{h}')
+
+        self.video_fps = fps = int(vc.get(cv2.CAP_PROP_FPS))
+        LOGGER.debug(f'fps = {fps}')
+        self.speed_factor = self._speed_factor  # update sleep_interval
+
+        self.video_total_frames = f = int(vc.get(cv2.CAP_PROP_FRAME_COUNT))
+        LOGGER.debug(f'total_frame = {f}')
+
+        self.lick_possibility = np.zeros((self.video_total_frames,), float)
+
+        return vc
+
     def _loop(self):
         while True:
+            t = time.time()
             try:
                 self._update()
             except KeyboardInterrupt:
@@ -197,6 +241,10 @@ class Main:
             except BaseException as e:
                 LOGGER.warning(e, exc_info=True)
                 raise
+
+            t = self._sleep_interval - (time.time() - t)
+            if t > 0:
+                time.sleep(t)
 
     def _update(self):
         vc = self.video_capture
@@ -209,6 +257,11 @@ class Main:
             self.current_image_original = image
 
         self.current_image = self.current_image_original.copy()
+        roi = self.current_roi
+
+        if roi is not None:
+            self.current_value = calculate_value(self.current_image_original, self._get_mask_cache(roi))
+            self.lick_possibility[self.current_frame] = self.current_value
 
         self._show_mouse_operator_text()
         self._show_queued_message()
@@ -216,18 +269,19 @@ class Main:
         if len(self.buffer):
             self._show_buffer()
 
-        if self._current_masking_region is not None:
-            self._show_mask_tmp()
-        elif self.show_mask:
-            mask = self.current_mask
-            if mask is not None:
-                self._show_mask(mask)
+        if self._current_roi_region is not None:
+            self._show_roi_tmp()
+        elif self.show_roi:
+            if roi is not None:
+                self._show_roi(roi)
+
+        if self.show_lick and self.lick_possibility is not None and roi is not None:
+            self._show_lick_possibility()
 
         if self.show_time:
             self._show_time_bar()
 
         cv2.imshow(self.window_title, self.current_image)
-        time.sleep(self._sleep_interval)
 
         k = cv2.waitKey(1)
         if k > 0:
@@ -259,13 +313,44 @@ class Main:
         buffer = self.buffer
         cv2.putText(self.current_image, buffer, (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
-    def _show_mask(self, mask: np.ndarray):
-        _, x0, y0, x1, y1 = mask
+    def _show_roi(self, roi: np.ndarray):
+        _, x0, y0, x1, y1 = roi
         cv2.rectangle(self.current_image, (x0, y0), (x1, y1), COLOR_YELLOW, 2, cv2.LINE_AA)
 
-    def _show_mask_tmp(self):
-        x0, y0, x1, y1 = self._current_masking_region
+    def _show_roi_tmp(self):
+        x0, y0, x1, y1 = self._current_roi_region
         cv2.rectangle(self.current_image, (x0, y0), (x1, y1), COLOR_GREEN, 2, cv2.LINE_AA)
+
+    def _show_lick_possibility(self):
+        s = 130
+        w = self.video_width
+        h = self.video_height
+        frame = self.current_frame
+        y0 = h - 30
+        length = w - 2 * s
+
+        duration = (self.show_lick_duration * self.video_fps) // 2
+        f0 = max(0, frame - duration)
+
+        cv2.putText(self.current_image, f'-{self.show_lick_duration} s', (10, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
+
+        if f0 != frame:
+            # FIXME not work properly
+            v = self.lick_possibility[f0:frame]
+            length = min(length, len(v))
+            y = np.histogram(v, bins=length)[0]
+            y = y / max(1, np.max(y))
+            y = y0 - 20 * y.astype(np.int32)
+            x = np.linspace(s, w - s, length, dtype=np.int32)
+            p = np.vstack((x, y)).transpose()
+            cv2.polylines(self.current_image, [p], 0, COLOR_RED, 2, cv2.LINE_AA)
+        else:
+            cv2.line(self.current_image, (s, y0), (w - s, y0), COLOR_RED, 1, cv2.LINE_AA)
+
+        if self.current_value is not None:
+            cv2.putText(self.current_image, f'{self.current_value:01.2f}', (w - 100, y0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
     def _show_time_bar(self):
         s = 130
@@ -281,9 +366,12 @@ class Main:
         cv2.putText(self.current_image, self._frame_to_text(frame), (10, h),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
+        # line
+        cv2.line(self.current_image, (s, h - 10), (w - s, h - 10), COLOR_RED, 3, cv2.LINE_AA)
+
         #
-        # mask frame
-        mx = self._frame_to_time_bar_x(self.mask[:, 0])
+        # roi frame
+        mx = self._frame_to_time_bar_x(self.roi[:, 0])
         for x in mx:
             cv2.line(self.current_image, (x, h - 20), (x, h), COLOR_YELLOW, 3, cv2.LINE_AA)
 
@@ -296,11 +384,11 @@ class Main:
             x = self._frame_to_time_bar_x(self._current_mouse_hover_frame)
 
             color = COLOR_GREEN
-            if self.mouse_stick_to_mask and len(mx) > 0:
+            if self.mouse_stick_to_roi and len(mx) > 0:
                 i = np.argmin(np.abs(mx - x))
                 if abs(mx[i] - x) < self.mouse_stick_distance:
                     x = mx[i]
-                    self._current_mouse_hover_frame = int(self.mask[i, 0])
+                    self._current_mouse_hover_frame = int(self.roi[i, 0])
                     color = COLOR_YELLOW
 
             cv2.line(self.current_image, (x, h - 20), (x, h), color, 3, cv2.LINE_AA)
@@ -308,9 +396,6 @@ class Main:
             # text
             cv2.putText(self.current_image, self._frame_to_text(self._current_mouse_hover_frame), (x - s // 2, h - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2, cv2.LINE_AA)
-
-        # line
-        cv2.line(self.current_image, (s, h - 10), (w - s, h - 10), COLOR_RED, 3, cv2.LINE_AA)
 
     def _set_mouse_hover_frame(self, x, y):
         w = self.video_width
@@ -345,16 +430,16 @@ class Main:
         print('q       : quit program')
         print('+/-     : in/decrease video playing speed')
         print('t       : show/hide progress bar')
-        print('m       : show/hide masks')
-        print('n       : print all masks')
-        print('s       : save masks')
+        print('r       : show/hide roi')
+        print('R       : print all roi')
+        print('s       : save roi')
         print('<space> : play/pause')
         print('0~9.    : input number')
         print('<backspace> : delete input number')
         print('c       : clear buffer')
         print('<num>j  : jump to time')
-        print('<num>d  : delete mask')
-        print('dd      : delete all maskes')
+        print('<num>d  : delete roi')
+        print('dd      : delete all roi')
 
     def handle_key_event(self, k: int):
         if k == ord('q'):
@@ -367,14 +452,14 @@ class Main:
             self.speed_factor /= 2
         elif k == ord('t'):
             self.show_time = not self.show_time
-        elif k == ord('m'):
-            self.show_mask = not self.show_mask
-        elif k == ord('n'):
-            np.savetxt(sys.stdout, self.mask, fmt='%d', delimiter='\t',
+        elif k == ord('r'):
+            self.show_roi = not self.show_roi
+        elif k == ord('R'):
+            np.savetxt(sys.stdout, self.roi, fmt='%d', delimiter='\t',
                        header='\t'.join(['time', 'x0', 'y0', 'x1', 'x2']))
         elif k == ord('s'):
             if self.roi_output_file is not None:
-                self.save_mask(self.roi_output_file)
+                self.save_roi(self.roi_output_file)
         elif k == ord(' '):
             self.is_playing = not self.is_playing
         elif 48 <= k < 58:  # 0-9
@@ -395,10 +480,10 @@ class Main:
                 self.buffer = ''
         elif k == ord('d'):
             if self.buffer == 'd':
-                self.clear_mask()
+                self.clear_roi()
                 self.buffer = ''
             elif len(self.buffer) > 0:
-                self.del_mask(int(self.buffer))
+                self.del_roi(int(self.buffer))
                 self.buffer = ''
             else:
                 self.buffer = 'd'
@@ -409,8 +494,8 @@ class Main:
     def handle_mouse_event(self, event: int, x: int, y: int, flag: int, data):
         if event == cv2.EVENT_MOUSEMOVE:
             if self._current_operation_state == self.MOUSE_STATE_MASKING:
-                x0, y0, _, _ = self._current_masking_region
-                self._current_masking_region = [x0, y0, x, y]
+                x0, y0, _, _ = self._current_roi_region
+                self._current_roi_region = [x0, y0, x, y]
             else:
                 if self.show_time:
                     self._set_mouse_hover_frame(x, y)
@@ -426,16 +511,16 @@ class Main:
 
         elif event == cv2.EVENT_RBUTTONDOWN:
             self._current_operation_state = self.MOUSE_STATE_MASKING
-            self._current_masking_region = [x, y, x, y]
+            self._current_roi_region = [x, y, x, y]
             self.is_playing = False
 
         elif event == cv2.EVENT_RBUTTONUP:
             if self._current_operation_state == self.MOUSE_STATE_MASKING:
                 t = self.current_frame
-                n = self.mask_count
-                self.add_mask(*self._current_masking_region)
-                self.enqueue_message(f'add mask[{n}] at ' + self._frame_to_text(t))
-                self._current_masking_region = None
+                n = self.roi_count
+                self.add_roi(*self._current_roi_region)
+                self.enqueue_message(f'add roi[{n}] at ' + self._frame_to_text(t))
+                self._current_roi_region = None
                 self._current_operation_state = self.MOUSE_STATE_FREE
             else:
                 self._current_operation_state = self.MOUSE_STATE_FREE
@@ -459,10 +544,10 @@ if __name__ == '__main__':
                     default=None,
                     help='use ROI file',
                     dest='use_roi')
-    ap.add_argument('--save-mask',
+    ap.add_argument('--save-roi',
                     metavar='FILE',
                     default=None,
-                    help='save roi mask usage',
+                    help='save roi path',
                     dest='save_roi')
     ap.add_argument('-o', '--output', '--output-data-path',
                     metavar='FILE',
