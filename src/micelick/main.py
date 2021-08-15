@@ -195,8 +195,8 @@ class Main:
             except KeyboardInterrupt:
                 raise
             except BaseException as e:
-                LOGGER.warning(e)
-                # raise
+                LOGGER.warning(e, exc_info=True)
+                raise
 
     def _update(self):
         vc = self.video_capture
@@ -293,21 +293,20 @@ class Main:
 
         # mouse hover
         if self._current_mouse_hover_frame is not None:
-            t = self._current_mouse_hover_frame
-            x = self._frame_to_time_bar_x(t)
+            x = self._frame_to_time_bar_x(self._current_mouse_hover_frame)
 
             color = COLOR_GREEN
             if self.mouse_stick_to_mask and len(mx) > 0:
                 i = np.argmin(np.abs(mx - x))
                 if abs(mx[i] - x) < self.mouse_stick_distance:
                     x = mx[i]
-                    t = self.mask[i, 0]
+                    self._current_mouse_hover_frame = int(self.mask[i, 0])
                     color = COLOR_YELLOW
 
             cv2.line(self.current_image, (x, h - 20), (x, h), color, 3, cv2.LINE_AA)
 
             # text
-            cv2.putText(self.current_image, self._frame_to_text(t), (x - s // 2, h - 20),
+            cv2.putText(self.current_image, self._frame_to_text(self._current_mouse_hover_frame), (x - s // 2, h - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2, cv2.LINE_AA)
 
         # line
@@ -334,7 +333,7 @@ class Main:
         elif isinstance(frame, np.ndarray):
             return ((w - 2 * s) * frame.astype(float) / t).astype(int) + s
         else:
-            raise TypeError()
+            raise TypeError(type(frame))
 
     def _frame_to_text(self, frame: int):
         t_sec = frame // self.video_fps
