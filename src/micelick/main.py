@@ -1,5 +1,6 @@
 import logging
 import os.path
+import sys
 import time
 from typing import Optional, Tuple
 
@@ -21,28 +22,12 @@ COLOR_BLUE = (255, 0, 0)
 COLOR_WHITE = (0, 0, 0)
 
 
-def select_roi(t: int, frame: np.ndarray) -> np.ndarray:
-    pass
-
-
 def calculate_value(video, mask: np.ndarray) -> np.ndarray:
     pass
 
 
 def calculate_licking(t: np.ndarray, value: np.ndarray) -> np.ndarray:
     pass
-
-
-def load_roi_mask(file: str) -> np.ndarray:
-    ret: np.ndarray = np.load(file)
-    # shape: (N, (time, x, y, width, height))
-    if not (ret.ndim == 2 and ret.shape[1] == 5):
-        raise RuntimeError('not a roi mask')
-    return ret
-
-
-def save_roi_mask(file: str, mask: np.ndarray):
-    np.save(file, mask)
 
 
 def save_licking_result(file: str, data: np.ndarray):
@@ -66,8 +51,11 @@ class Main:
 
         # property
         self.window_title = 'MouseLicking'
-        self.mask = np.zeros((0, 5), dtype=int)
+        self.mask: np.ndarray = np.zeros((0, 5), dtype=int)
         self.show_time = True
+        self.show_mask = True
+        self.mouse_stick_to_mask = True
+        self.mouse_stick_distance = 5
         self.message_fade_time = 5
 
         # video property
@@ -134,6 +122,46 @@ class Main:
     def enqueue_message(self, text: str):
         self._message_queue.append((time.time(), text))
 
+    @property
+    def mask_count(self) -> int:
+        return self.mask.shape[0]
+
+    @property
+    def current_mask(self) -> Optional[np.ndarray]:
+        f = self.current_frame
+        ret = None
+        for mask in self.mask:
+            t = mask[0]
+            if t < f:
+                ret = mask
+        return ret
+
+    def add_mask(self, x0: int, y0: int, x1: int, y1: int, t: int = None):
+        if t is None:
+            t = self.current_frame
+
+        self.mask = np.sort(np.append(self.mask, [(t, x0, y0, x1, y1)], axis=0), axis=0)
+        LOGGER.info(f'add mask [{t},{x0},{y0},{x1},{y1}]')
+
+    def del_mask(self, index: int):
+        t, x0, y0, x1, y1 = self.mask[index]
+        self.mask = np.delete(self.mask, index, axis=0)
+        LOGGER.info(f'del mask [{t},{x0},{y0},{x1},{y1}]')
+
+    def clear_mask(self):
+        self.mask = np.zeros((0, 5), dtype=int)
+
+    def load_mask(self, file: str):
+        LOGGER.debug(f'load mask = {file}')
+        ret: np.ndarray = np.load(file)
+        # shape: (N, (time, x, y, width, height))
+        if not (ret.ndim == 2 and ret.shape[1] == 5):
+            raise RuntimeError('not a roi mask')
+        self.mask = ret
+
+    def save_mask(self, file: str):
+        np.save(file, self.mask)
+
     def start(self, pause_on_start=False):
         LOGGER.debug(f'file = {self.video_file}')
         self.video_capture = vc = cv2.VideoCapture(self.video_file)
@@ -167,7 +195,8 @@ class Main:
             except KeyboardInterrupt:
                 raise
             except BaseException as e:
-                print(e)
+                LOGGER.warning(e)
+                # raise
 
     def _update(self):
         vc = self.video_capture
@@ -189,6 +218,10 @@ class Main:
 
         if self._current_masking_region is not None:
             self._show_mask_tmp()
+        elif self.show_mask:
+            mask = self.current_mask
+            if mask is not None:
+                self._show_mask(mask)
 
         if self.show_time:
             self._show_time_bar()
@@ -227,46 +260,81 @@ class Main:
         cv2.putText(self.current_image, buffer, (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
     def _show_mask(self, mask: np.ndarray):
-        pass
+        _, x0, y0, x1, y1 = mask
+        cv2.rectangle(self.current_image, (x0, y0), (x1, y1), COLOR_YELLOW, 2, cv2.LINE_AA)
 
     def _show_mask_tmp(self):
         x0, y0, x1, y1 = self._current_masking_region
-        cv2.rectangle(self.current_image, (x0, y0), (x1, y1), COLOR_YELLOW, 2, cv2.LINE_AA)
+        cv2.rectangle(self.current_image, (x0, y0), (x1, y1), COLOR_GREEN, 2, cv2.LINE_AA)
 
     def _show_time_bar(self):
+        s = 130
         w = self.video_width
         h = self.video_height
         frame = self.current_frame
 
+        # total frame text
         cv2.putText(self.current_image, self._frame_to_text(self.video_total_frames), (w - 100, h),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
+        # current frame text
         cv2.putText(self.current_image, self._frame_to_text(frame), (10, h),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
-        s = 130
-        x = int((w - 2 * s) * frame / self.video_total_frames) + s
+        #
+        # mask frame
+        mx = self._frame_to_time_bar_x(self.mask[:, 0])
+        for x in mx:
+            cv2.line(self.current_image, (x, h - 20), (x, h), COLOR_YELLOW, 3, cv2.LINE_AA)
+
+        # current frame
+        x = self._frame_to_time_bar_x(frame)
         cv2.line(self.current_image, (x, h - 20), (x, h), COLOR_RED, 3, cv2.LINE_AA)
 
+        # mouse hover
         if self._current_mouse_hover_frame is not None:
-            x = int((w - 2 * s) * self._current_mouse_hover_frame / self.video_total_frames) + s
-            cv2.line(self.current_image, (x, h - 20), (x, h), COLOR_GREEN, 3, cv2.LINE_AA)
+            t = self._current_mouse_hover_frame
+            x = self._frame_to_time_bar_x(t)
+
+            color = COLOR_GREEN
+            if self.mouse_stick_to_mask and len(mx) > 0:
+                i = np.argmin(np.abs(mx - x))
+                if abs(mx[i] - x) < self.mouse_stick_distance:
+                    x = mx[i]
+                    t = self.mask[i, 0]
+                    color = COLOR_YELLOW
+
+            cv2.line(self.current_image, (x, h - 20), (x, h), color, 3, cv2.LINE_AA)
 
             # text
-            cv2.putText(self.current_image, self._frame_to_text(self._current_mouse_hover_frame), (x - s // 2, h - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_GREEN, 2, cv2.LINE_AA)
+            cv2.putText(self.current_image, self._frame_to_text(t), (x - s // 2, h - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2, cv2.LINE_AA)
 
+        # line
         cv2.line(self.current_image, (s, h - 10), (w - s, h - 10), COLOR_RED, 3, cv2.LINE_AA)
 
     def _set_mouse_hover_frame(self, x, y):
         w = self.video_width
         h = self.video_height
+        t = self.video_total_frames
         s = 130
 
         if (h - 20 <= y <= h) and (s <= x <= w - s):
-            self._current_mouse_hover_frame = int((x - s) / (w - 2 * s) * self.video_total_frames)
+            self._current_mouse_hover_frame = int((x - s) / (w - 2 * s) * t)
         else:
             self._current_mouse_hover_frame = None
+
+    def _frame_to_time_bar_x(self, frame):
+        w = self.video_width
+        t = self.video_total_frames
+        s = 130
+
+        if isinstance(frame, (int, float)):
+            return int((w - 2 * s) * frame / t) + s
+        elif isinstance(frame, np.ndarray):
+            return ((w - 2 * s) * frame.astype(float) / t).astype(int) + s
+        else:
+            raise TypeError()
 
     def _frame_to_text(self, frame: int):
         t_sec = frame // self.video_fps
@@ -278,11 +346,16 @@ class Main:
         print('q       : quit program')
         print('+/-     : in/decrease video playing speed')
         print('t       : show/hide progress bar')
+        print('m       : show/hide masks')
+        print('n       : print all masks')
+        print('s       : save masks')
         print('<space> : play/pause')
         print('0~9.    : input number')
         print('<backspace> : delete input number')
         print('c       : clear buffer')
         print('<num>j  : jump to time')
+        print('<num>d  : delete mask')
+        print('dd      : delete all maskes')
 
     def handle_key_event(self, k: int):
         if k == ord('q'):
@@ -295,6 +368,14 @@ class Main:
             self.speed_factor /= 2
         elif k == ord('t'):
             self.show_time = not self.show_time
+        elif k == ord('m'):
+            self.show_mask = not self.show_mask
+        elif k == ord('n'):
+            np.savetxt(sys.stdout, self.mask, fmt='%d', delimiter='\t',
+                       header='\t'.join(['time', 'x0', 'y0', 'x1', 'x2']))
+        elif k == ord('s'):
+            if self.roi_output_file is not None:
+                self.save_mask(self.roi_output_file)
         elif k == ord(' '):
             self.is_playing = not self.is_playing
         elif 48 <= k < 58:  # 0-9
@@ -308,15 +389,20 @@ class Main:
             self.buffer = ''
         elif k == ord('j'):
             if len(self.buffer) > 0:
-                try:
-                    t_min, t_sec = _decode_buffer_as_time(self.buffer)
-                except BaseException as e:
-                    print(e)
-                else:
-                    frame = (t_min * 60 + t_sec) * self.video_fps
-                    self.current_frame = frame
-                    LOGGER.debug(f'jump to {t_min:02d}:{t_sec:02d} (frame={frame})')
-                    self.buffer = ''
+                t_min, t_sec = _decode_buffer_as_time(self.buffer)
+                frame = (t_min * 60 + t_sec) * self.video_fps
+                self.current_frame = frame
+                LOGGER.debug(f'jump to {t_min:02d}:{t_sec:02d} (frame={frame})')
+                self.buffer = ''
+        elif k == ord('d'):
+            if self.buffer == 'd':
+                self.clear_mask()
+                self.buffer = ''
+            elif len(self.buffer) > 0:
+                self.del_mask(int(self.buffer))
+                self.buffer = ''
+            else:
+                self.buffer = 'd'
 
         else:
             LOGGER.debug(f'key_input : {k}')
@@ -341,21 +427,20 @@ class Main:
 
         elif event == cv2.EVENT_RBUTTONDOWN:
             self._current_operation_state = self.MOUSE_STATE_MASKING
-            self._current_masking_region = [x, y, 0, 0]
+            self._current_masking_region = [x, y, x, y]
             self.is_playing = False
 
         elif event == cv2.EVENT_RBUTTONUP:
             if self._current_operation_state == self.MOUSE_STATE_MASKING:
                 t = self.current_frame
-                x0, y0, x1, y1 = self._current_masking_region
-                n = self.mask.shape[0]
-                self.mask = np.append(self.mask, [(t, x0, y0, x1, y1)], axis=0)
+                n = self.mask_count
+                self.add_mask(*self._current_masking_region)
                 self.enqueue_message(f'add mask[{n}] at ' + self._frame_to_text(t))
-                LOGGER.info(f'set mask [{t},{x0},{y0},{x1},{y1}]')
                 self._current_masking_region = None
                 self._current_operation_state = self.MOUSE_STATE_FREE
             else:
                 self._current_operation_state = self.MOUSE_STATE_FREE
+
 
 def _decode_buffer_as_time(buffer: str) -> Tuple[int, int]:
     if '.' in buffer:
