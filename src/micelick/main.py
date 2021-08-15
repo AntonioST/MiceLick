@@ -15,8 +15,10 @@ LOGGER = logging.getLogger('MiceLick')
 CURRENT_WINDOW_HANDLE = None
 
 COLOR_RED = (0, 0, 255)
+COLOR_YELLOW = (0, 255, 255)
 COLOR_GREEN = (0, 255, 0)
 COLOR_BLUE = (255, 0, 0)
+COLOR_WHITE = (0, 0, 0)
 
 
 def select_roi(t: int, frame: np.ndarray) -> np.ndarray:
@@ -48,6 +50,10 @@ def save_licking_result(file: str, data: np.ndarray):
 
 
 class Main:
+    MOUSE_STATE_FREE = 0
+    MOUSE_STATE_MASKING = 1
+    MOUSE_STATE_MASKED = 2
+
     def __init__(self, video_file: str):
         if not os.path.exists(video_file):
             raise FileNotFoundError(video_file)
@@ -60,6 +66,9 @@ class Main:
 
         # property
         self.window_title = 'MouseLicking'
+        self.mask = np.zeros((0, 5), dtype=int)
+        self.show_time = True
+        self.message_fade_time = 5
 
         # video property
         self.video_capture: cv2.VideoCapture = None
@@ -74,7 +83,11 @@ class Main:
         self._speed_factor: float = 1
         self._sleep_interval = 1
         self._is_playing = False
-        self.show_time = True
+        self._current_operation_state = self.MOUSE_STATE_FREE
+        self._current_mouse_hover_frame = None
+        self._current_mouse_button = None
+        self._current_masking_region = None
+        self._message_queue = []
         self.buffer = ''
 
     @property
@@ -118,6 +131,9 @@ class Main:
         else:
             LOGGER.debug('pause')
 
+    def enqueue_message(self, text: str):
+        self._message_queue.append((time.time(), text))
+
     def start(self, pause_on_start=False):
         LOGGER.debug(f'file = {self.video_file}')
         self.video_capture = vc = cv2.VideoCapture(self.video_file)
@@ -133,6 +149,7 @@ class Main:
         LOGGER.debug(f'total_frame = {f}')
 
         cv2.namedWindow(self.window_title, cv2.WINDOW_GUI_NORMAL)
+        cv2.setMouseCallback(self.window_title, self.handle_mouse_event)
 
         try:
             self._is_playing = not pause_on_start
@@ -164,8 +181,14 @@ class Main:
 
         self.current_image = self.current_image_original.copy()
 
+        self._show_mouse_operator_text()
+        self._show_queued_message()
+
         if len(self.buffer):
             self._show_buffer()
+
+        if self._current_masking_region is not None:
+            self._show_mask_tmp()
 
         if self.show_time:
             self._show_time_bar()
@@ -177,29 +200,78 @@ class Main:
         if k > 0:
             self.handle_key_event(k)
 
+    def _show_mouse_operator_text(self):
+        if self._current_operation_state == self.MOUSE_STATE_FREE:
+            pass
+        elif self._current_operation_state == self.MOUSE_STATE_MASKING:
+            cv2.putText(self.current_image, 'select ROI', (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
+
+    def _show_queued_message(self):
+        t = time.time()
+        y = 70
+        s = 25
+        i = 0
+        while i < len(self._message_queue):
+            r, m = self._message_queue[i]
+            if r + self.message_fade_time < t:
+                del self._message_queue[i]
+            else:
+                cv2.putText(self.current_image, m, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
+                i += 1
+                y += s
+
     def _show_buffer(self):
+        h = self.video_height
         buffer = self.buffer
-        cv2.putText(self.current_image, buffer, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
+        cv2.putText(self.current_image, buffer, (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
+
+    def _show_mask(self, mask: np.ndarray):
+        pass
+
+    def _show_mask_tmp(self):
+        x0, y0, x1, y1 = self._current_masking_region
+        cv2.rectangle(self.current_image, (x0, y0), (x1, y1), COLOR_YELLOW, 2, cv2.LINE_AA)
 
     def _show_time_bar(self):
         w = self.video_width
         h = self.video_height
         frame = self.current_frame
 
-        t_sec = self.video_total_frames // self.video_fps
-        t_min, t_sec = t_sec // 60, t_sec % 60
-        t_text = f'{t_min:02d}:{t_sec:02d}'
-        cv2.putText(self.current_image, t_text, (w - 100, h), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
+        cv2.putText(self.current_image, self._frame_to_text(self.video_total_frames), (w - 100, h),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
-        t_sec = frame // self.video_fps
-        t_min, t_sec = t_sec // 60, t_sec % 60
-        t_text = f'{t_min:02d}:{t_sec:02d}'
-        cv2.putText(self.current_image, t_text, (10, h), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
+        cv2.putText(self.current_image, self._frame_to_text(frame), (10, h),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
         s = 130
-        cv2.line(self.current_image, (s, h - 10), (w - s, h - 10), COLOR_RED, 3, cv2.LINE_AA)
         x = int((w - 2 * s) * frame / self.video_total_frames) + s
         cv2.line(self.current_image, (x, h - 20), (x, h), COLOR_RED, 3, cv2.LINE_AA)
+
+        if self._current_mouse_hover_frame is not None:
+            x = int((w - 2 * s) * self._current_mouse_hover_frame / self.video_total_frames) + s
+            cv2.line(self.current_image, (x, h - 20), (x, h), COLOR_GREEN, 3, cv2.LINE_AA)
+
+            # text
+            cv2.putText(self.current_image, self._frame_to_text(self._current_mouse_hover_frame), (x - s // 2, h - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_GREEN, 2, cv2.LINE_AA)
+
+        cv2.line(self.current_image, (s, h - 10), (w - s, h - 10), COLOR_RED, 3, cv2.LINE_AA)
+
+    def _set_mouse_hover_frame(self, x, y):
+        w = self.video_width
+        h = self.video_height
+        s = 130
+
+        if (h - 20 <= y <= h) and (s <= x <= w - s):
+            self._current_mouse_hover_frame = int((x - s) / (w - 2 * s) * self.video_total_frames)
+        else:
+            self._current_mouse_hover_frame = None
+
+    def _frame_to_text(self, frame: int):
+        t_sec = frame // self.video_fps
+        t_min, t_sec = t_sec // 60, t_sec % 60
+        return f'{t_min:02d}:{t_sec:02d}'
 
     def _print_key_shortcut(self):
         print('h       : print key shortcut help')
@@ -249,6 +321,41 @@ class Main:
         else:
             LOGGER.debug(f'key_input : {k}')
 
+    def handle_mouse_event(self, event: int, x: int, y: int, flag: int, data):
+        if event == cv2.EVENT_MOUSEMOVE:
+            if self._current_operation_state == self.MOUSE_STATE_MASKING:
+                x0, y0, _, _ = self._current_masking_region
+                self._current_masking_region = [x0, y0, x, y]
+            else:
+                if self.show_time:
+                    self._set_mouse_hover_frame(x, y)
+                else:
+                    self._current_mouse_hover_frame = None
+
+        elif event == cv2.EVENT_LBUTTONUP:
+            if self._current_operation_state == self.MOUSE_STATE_FREE:
+                if self._current_mouse_hover_frame is not None:
+                    self.current_frame = self._current_mouse_hover_frame
+                else:
+                    self.is_playing = not self.is_playing
+
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            self._current_operation_state = self.MOUSE_STATE_MASKING
+            self._current_masking_region = [x, y, 0, 0]
+            self.is_playing = False
+
+        elif event == cv2.EVENT_RBUTTONUP:
+            if self._current_operation_state == self.MOUSE_STATE_MASKING:
+                t = self.current_frame
+                x0, y0, x1, y1 = self._current_masking_region
+                n = self.mask.shape[0]
+                self.mask = np.append(self.mask, [(t, x0, y0, x1, y1)], axis=0)
+                self.enqueue_message(f'add mask[{n}] at ' + self._frame_to_text(t))
+                LOGGER.info(f'set mask [{t},{x0},{y0},{x1},{y1}]')
+                self._current_masking_region = None
+                self._current_operation_state = self.MOUSE_STATE_FREE
+            else:
+                self._current_operation_state = self.MOUSE_STATE_FREE
 
 def _decode_buffer_as_time(buffer: str) -> Tuple[int, int]:
     if '.' in buffer:
