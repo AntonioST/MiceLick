@@ -107,6 +107,7 @@ class Main:
             raise ValueError()
 
         vc.set(cv2.CAP_PROP_POS_FRAMES, value)
+        self.current_image_original = None
 
     @property
     def is_playing(self) -> bool:
@@ -471,6 +472,7 @@ class Main:
         print('R       : print all roi')
         print('s       : save roi')
         print('<space> : play/pause')
+        print('<left>/<right> : jump back/forward 5 seconds')
         print('0~9.    : input number')
         print('<backspace> : delete input number')
         print('c       : clear buffer')
@@ -499,6 +501,10 @@ class Main:
                 self.save_roi(self.roi_output_file)
         elif k == ord(' '):
             self.is_playing = not self.is_playing
+        elif k == 81:  # left
+            self.current_frame = max(0, self.current_frame - 5 * self.video_fps)
+        elif k == 83:  # right
+            self.current_frame = min(self.video_total_frames - 1, self.current_frame + 5 * self.video_fps)
         elif 48 <= k < 58:  # 0-9
             self.buffer += '0123456789'[k - 48]
         elif k == ord('.'):
