@@ -1,6 +1,5 @@
 import logging
 import os.path
-import sys
 import time
 from typing import Optional, Tuple, List
 
@@ -55,6 +54,7 @@ class Main:
         self.show_lick = True
         self.show_lick_duration = 30
         self.show_roi = True
+        self.eval_lick = True
         self.mouse_stick_to_roi = True
         self.mouse_stick_distance = 5
         self.message_fade_time = 5
@@ -78,6 +78,7 @@ class Main:
         self._message_queue: List[Tuple[float, str]] = []
         self._mask_cache: Optional[Tuple[int, np.ndarray, np.ndarray]] = None
         self.buffer = ''
+        self._key_action_dict = None
 
     @property
     def speed_factor(self) -> float:
@@ -88,6 +89,7 @@ class Main:
         value = min(32.0, max(0.25, value))
         self._speed_factor = value
         self._sleep_interval = 1 / self.video_fps / value
+        self.enqueue_message(f'x{value}')
         LOGGER.debug(f'speed = {value}')
 
     @property
@@ -160,17 +162,48 @@ class Main:
         self.roi = np.zeros((0, 5), dtype=int)
 
     def load_roi(self, file: str) -> np.ndarray:
-        LOGGER.debug(f'load mask = {file}')
+        LOGGER.debug(f'load roi = {file}')
         ret: np.ndarray = np.load(file)
+
         # shape: (N, (time, x, y, width, height))
         if not (ret.ndim == 2 and ret.shape[1] == 5):
             raise RuntimeError('not a roi mask')
+
         self.roi = ret
         return ret
 
     def save_roi(self, file: str):
         np.save(file, self.roi)
+        self.enqueue_message(f'save roi = {file}')
         LOGGER.debug(f'save roi = {file}')
+
+    def save_result(self, file: str):
+        if self.lick_possibility is None:
+            raise RuntimeError()
+
+        fps = self.video_fps
+        size = self.video_total_frames
+        data = np.zeros((size, 3), dtype=float)
+        data[:, 0] = np.linspace(0, size / fps, num=size)
+        data[:, 2] = self.lick_possibility
+
+        data[:, 1] = -1
+        for roi in self.roi:
+            data[:, roi[0]:] += 1
+
+        np.save(file, data)
+        self.enqueue_message(f'save result = {file}')
+        LOGGER.debug(f'save result = {file}')
+
+    def load_result(self, file: str):
+        size = self.video_total_frames
+
+        LOGGER.debug(f'load result = {file}')
+        data = np.load(file)
+        if data.shape != (size, 3):
+            raise RuntimeError('result file not match to current video')
+
+        self.lick_possibility = data[:, 2].copy()
 
     def _get_mask_cache(self, roi: np.ndarray) -> np.ndarray:
         if self._mask_cache is None or self._mask_cache[0] != roi[0]:
@@ -198,8 +231,10 @@ class Main:
         except KeyboardInterrupt:
             pass
         finally:
+            LOGGER.debug('closing')
             vc.release()
             cv2.destroyWindow(self.window_title)
+            LOGGER.debug('closed')
 
     def start_no_gui(self):
         LOGGER.debug('start no GUI')
@@ -244,12 +279,13 @@ class Main:
                     lick_possibility[frame] = 0
 
             LOGGER.debug(f'... 100% ...')
-            LOGGER.debug(f'save result = {self.output_file}')
-            np.save(self.output_file, lick_possibility)
+            self.save_result(self.output_file)
         except KeyboardInterrupt:
             pass
         finally:
+            LOGGER.debug('closing')
             vc.release()
+            LOGGER.debug('closed')
 
     def _init_video(self) -> cv2.VideoCapture:
         LOGGER.debug(f'file = {self.video_file}')
@@ -297,11 +333,12 @@ class Main:
         self.current_image = self.current_image_original.copy()
         roi = self.current_roi
 
-        if roi is not None:
+        if roi is not None and self.eval_lick:
             self.current_value = self.calculate_value(self.current_image_original, roi)
             self.lick_possibility[self.current_frame] = self.current_value
+        else:
+            self.current_value = self.lick_possibility[self.current_frame]
 
-        self._show_mouse_operator_text()
         self._show_queued_message()
 
         if len(self.buffer):
@@ -325,13 +362,6 @@ class Main:
         if k > 0:
             self.handle_key_event(k)
 
-    def _show_mouse_operator_text(self):
-        if self._current_operation_state == self.MOUSE_STATE_FREE:
-            pass
-        elif self._current_operation_state == self.MOUSE_STATE_MASKING:
-            cv2.putText(self.current_image, 'select ROI', (10, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
-
     def _show_queued_message(self):
         t = time.time()
         y = 70
@@ -349,7 +379,7 @@ class Main:
     def _show_buffer(self):
         h = self.video_height
         buffer = self.buffer
-        cv2.putText(self.current_image, buffer, (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
+        cv2.putText(self.current_image, buffer, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
     def _show_roi(self, roi: np.ndarray):
         _, x0, y0, x1, y1 = roi
@@ -463,76 +493,238 @@ class Main:
         t_min, t_sec = t_sec // 60, t_sec % 60
         return f'{t_min:02d}:{t_sec:02d}'
 
-    def _print_key_shortcut(self):
-        print('h       : print key shortcut help')
-        print('q       : quit program')
-        print('+/-     : in/decrease video playing speed')
-        print('t       : show/hide progress bar')
-        print('r       : show/hide roi')
-        print('R       : print all roi')
-        print('s       : save roi')
-        print('<space> : play/pause')
-        print('<left>/<right> : jump back/forward 5 seconds')
-        print('0~9.    : input number')
-        print('<backspace> : delete input number')
-        print('c       : clear buffer')
-        print('<num>j  : jump to time')
-        print('<num>d  : delete roi')
-        print('dd      : delete all roi')
-
     def handle_key_event(self, k: int):
-        if k == ord('q'):
-            raise KeyboardInterrupt
-        elif k == ord('h'):
-            self._print_key_shortcut()
-        elif k == ord('+'):
-            self.speed_factor *= 2
-        elif k == ord('-'):
-            self.speed_factor /= 2
-        elif k == ord('t'):
-            self.show_time = not self.show_time
-        elif k == ord('r'):
-            self.show_roi = not self.show_roi
-        elif k == ord('R'):
-            np.savetxt(sys.stdout, self.roi, fmt='%d', delimiter='\t',
-                       header='\t'.join(['time', 'x0', 'y0', 'x1', 'x2']))
-        elif k == ord('s'):
-            if self.roi_output_file is not None:
-                self.save_roi(self.roi_output_file)
-        elif k == ord(' '):
+        if k == 27:  # escape:
+            self.buffer = ''
+        elif k == 8:  # backspace
+            if len(self.buffer) > 0:
+                self.buffer = self.buffer[:-1]
+        elif len(self.buffer) == 0 and k == 32:  # space
             self.is_playing = not self.is_playing
         elif k == 81:  # left
             self.current_frame = max(0, self.current_frame - 5 * self.video_fps)
         elif k == 83:  # right
             self.current_frame = min(self.video_total_frames - 1, self.current_frame + 5 * self.video_fps)
-        elif 48 <= k < 58:  # 0-9
-            self.buffer += '0123456789'[k - 48]
-        elif k == ord('.'):
-            self.buffer += '.'
-        elif k == 8:  # backspace
-            if len(self.buffer) > 0:
-                self.buffer = self.buffer[:-1]
-        elif k == ord('c'):
+        elif len(self.buffer) == 0 and k == ord('+'):
+            self.speed_factor *= 2
+        elif len(self.buffer) == 0 and k == ord('-'):
+            self.speed_factor /= 2
+        elif k == 13:  # enter:
+            command = self.buffer
             self.buffer = ''
-        elif k == ord('j'):
-            if len(self.buffer) > 0:
-                t_min, t_sec = _decode_buffer_as_time(self.buffer)
+            try:
+                self.handle_command(command)
+            except KeyboardInterrupt:
+                raise
+            except BaseException as e:
+                LOGGER.warning(f'command "{command}" : {e}', exc_info=1)
+                self.enqueue_message(str(e))
+        elif 32 < k < 127:  # printable
+            self.buffer += chr(k)
+
+    def handle_command(self, command: str):
+        if command == 'h':
+            self.enqueue_message('h             : print key shortcut help')
+            self.enqueue_message('q             : quit program')
+            self.enqueue_message('j             : jump to ...')
+            self.enqueue_message('d             : display ...')
+            self.enqueue_message('r             : roi ...')
+            self.enqueue_message('o             : result ...')
+
+        elif command == 'q':
+            raise KeyboardInterrupt
+
+        elif command == 'j':
+            self.enqueue_message('j<sec>        : jump to <sec> time')
+            self.enqueue_message('j<min>:<sec>  : jump to <min>:<sec> time')
+            self.enqueue_message('jend          : jump to END')
+            self.enqueue_message('jr<idx>       : jump to <idx> roi time')
+
+        elif command.startswith('j'):
+            if command == 'jend':
+                self.current_frame = self.video_total_frames - 1
+                LOGGER.debug(f'jump to END')
+            elif command.startswith('jr'):
+                self.handle_command(f'r{int(command[2:])}j')
+            else:
+                t_min, t_sec = _decode_buffer_as_time(command[1:])
                 frame = (t_min * 60 + t_sec) * self.video_fps
                 self.current_frame = frame
                 LOGGER.debug(f'jump to {t_min:02d}:{t_sec:02d} (frame={frame})')
-                self.buffer = ''
-        elif k == ord('d'):
-            if self.buffer == 'd':
-                self.clear_roi()
-                self.buffer = ''
-            elif len(self.buffer) > 0:
-                self.del_roi(int(self.buffer))
-                self.buffer = ''
+
+        elif command == 'd':
+            self.enqueue_message('dtime[+-?]    : display time line')
+            self.enqueue_message('dlick[+-?]    : display lick curve')
+            self.enqueue_message('droi[+-?]     : display roi rectangle')
+
+        elif command.startswith('dtime'):
+            if command == 'dtime':
+                self.show_time = not self.show_time
+            elif command == 'dtime+':
+                self.show_time = True
+            elif command == 'dtime-':
+                self.show_time = False
+            elif command == 'dtime?':
+                pass
             else:
-                self.buffer = 'd'
+                raise ValueError(command)
+
+            self.enqueue_message('show time : ' + ('on' if self.show_time else 'off'))
+
+        elif command.startswith('dlick'):
+            if command == 'dlick':
+                self.show_lick = not self.show_lick
+            elif command == 'dlick+':
+                self.show_lick = True
+            elif command == 'dlick-':
+                self.show_lick = False
+            elif command == 'dlick?':
+                pass
+            else:
+                raise ValueError(command)
+
+            self.enqueue_message('show lick : ' + ('on' if self.show_lick else 'off'))
+
+        elif command.startswith('droi'):
+            if command == 'droi':
+                self.show_roi = not self.show_roi
+            elif command == 'droi+':
+                self.show_roi = True
+            elif command == 'droi-':
+                self.show_roi = False
+            elif command == 'droi?':
+                pass
+            else:
+                raise ValueError(command)
+
+            self.enqueue_message('show roi : ' + ('on' if self.show_roi else 'off'))
+
+        elif command == 'r':
+            self.enqueue_message('rp            : print current roi information')
+            self.enqueue_message('ra            : print all roi information')
+            self.enqueue_message('r<idx>j       : jump to <idx> roi time')
+            self.enqueue_message('r<idx>d       : delete <idx> roi')
+            self.enqueue_message('rdd           : delete all roi')
+            self.enqueue_message('rload <file>  : load roi')
+            self.enqueue_message('rload?        : print use roi file')
+            self.enqueue_message('rsave <file>  : save roi')
+            self.enqueue_message('rsave?        : print save roi file')
+
+        elif command == 'rp':
+            roi = self.current_roi
+            idx = np.nonzero(self.roi[:, 0] == roi[0])[0][0]
+            self.enqueue_message(f'roi[{idx}] t={roi[0]} ({roi[1]},{roi[2]}).({roi[3]},{roi[4]})')
+
+        elif command == 'ra':
+            cnt_roi = self.current_roi
+            for idx, roi in enumerate(self.roi):
+                if cnt_roi[0] == roi[0]:
+                    self.enqueue_message(f'*roi[{idx}] t={roi[0]} ({roi[1]},{roi[2]}).({roi[3]},{roi[4]})')
+                else:
+                    self.enqueue_message(f' roi[{idx}] t={roi[0]} ({roi[1]},{roi[2]}).({roi[3]},{roi[4]})')
+
+        elif command.startswith('r') and command.endswith('j'):
+            idx = int(command[1:-1])
+            frame = self.roi[idx, 0]
+            self.current_frame = frame
+            LOGGER.debug(f'jump to roi[{idx}] (frame={frame})')
+
+        elif command.startswith('r') and command.endswith('d'):
+            self.del_roi(int(command[1:-1]))
+
+        elif command == 'rdd':
+            self.clear_roi()
+
+        elif command == 'rsave?':
+            self.enqueue_message(str(self.roi_output_file))
+        elif command == 'rload?':
+            self.enqueue_message(str(self.roi_use_file))
+
+        elif command.startswith('rsave'):
+            part: List[str] = list(filter(len, command.split(' ')))
+            if len(part) == 1:
+                if self.roi_output_file is not None:
+                    self.save_roi(self.roi_output_file)
+                else:
+                    self.enqueue_message('None roi_output_file')
+            elif len(part) == 2:
+                self.roi_output_file = part[1]
+                self.save_roi(self.roi_output_file)
+            else:
+                raise ValueError()
+
+        elif command.startswith('rload'):
+            part: List[str] = list(filter(len, command.split(' ')))
+            if len(part) == 1:
+                if self.roi_use_file is not None:
+                    self.load_roi(self.roi_use_file)
+                else:
+                    self.enqueue_message('None roi_use_file')
+            elif len(part) == 2:
+                self.roi_use_file = part[1]
+                self.load_roi(self.roi_use_file)
+            else:
+                raise ValueError()
+
+        elif command == 'o':
+            self.enqueue_message('oeval[+-?]    : en/disable licking calculation')
+            self.enqueue_message('oclear        : clear result')
+            self.enqueue_message('osave <file>  : save result')
+            self.enqueue_message('oload <file>  : load result')
+            self.enqueue_message('rload?        : print result output file')
+            self.enqueue_message('rsave?        : print result output file')
+
+        elif command.startswith('oeval'):
+            if command == 'oeval':
+                self.eval_lick = not self.eval_lick
+            elif command == 'oeval+':
+                self.eval_lick = True
+            elif command == 'oeval-':
+                self.eval_lick = False
+            elif command == 'oeval?':
+                pass
+            else:
+                raise ValueError(command)
+
+            self.enqueue_message('eval lick : ' + ('on' if self.eval_lick else 'off'))
+
+        elif command == 'oclear':
+            self.lick_possibility[:] = 0
+
+        elif command == 'osave?':
+            self.enqueue_message(str(self.output_file))
+        elif command == 'oload?':
+            self.enqueue_message(str(self.output_file))
+
+        elif command.startswith('osave'):
+            part: List[str] = list(filter(len, command.split(' ')))
+            if len(part) == 1:
+                if self.output_file is not None:
+                    self.save_result(self.output_file)
+                else:
+                    self.enqueue_message('None output_file')
+            elif len(part) == 2:
+                self.output_file = part[1]
+                self.save_result(self.output_file)
+            else:
+                raise ValueError()
+
+        elif command.startswith('oload'):
+            part: List[str] = list(filter(len, command.split(' ')))
+            if len(part) == 1:
+                if self.output_file is not None:
+                    self.load_result(self.output_file)
+                else:
+                    self.enqueue_message('None output_file')
+            elif len(part) == 2:
+                self.output_file = part[1]
+                self.load_result(self.output_file)
+            else:
+                raise ValueError()
 
         else:
-            LOGGER.debug(f'key_input : {k}')
+            # self.enqueue_message('q             : quit program')
+            self.enqueue_message(f'unknown command : {command}')
 
     def handle_mouse_event(self, event: int, x: int, y: int, flag: int, data):
         if event == cv2.EVENT_MOUSEMOVE:
@@ -570,8 +762,8 @@ class Main:
 
 
 def _decode_buffer_as_time(buffer: str) -> Tuple[int, int]:
-    if '.' in buffer:
-        t_min, t_sec = buffer.split('.')
+    if ':' in buffer:
+        t_min, t_sec = buffer.split(':')
         return int(t_min), int(t_sec)
     else:
         t_sec = int(buffer)
