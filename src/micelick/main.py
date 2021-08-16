@@ -30,23 +30,9 @@ def rectangle_to_mask(w: int, h: int, roi: np.ndarray) -> np.ndarray:
     return ret
 
 
-def calculate_value(image: np.ndarray, mask: np.ndarray) -> float:
-    img = cv2.cvtColor(cv2.bitwise_and(image, mask), cv2.COLOR_BGR2GRAY)
-    return np.mean(img)
-
-
-def calculate_licking(t: np.ndarray, value: np.ndarray) -> np.ndarray:
-    pass
-
-
-def save_licking_result(file: str, data: np.ndarray):
-    pass
-
-
 class Main:
     MOUSE_STATE_FREE = 0
     MOUSE_STATE_MASKING = 1
-    MOUSE_STATE_MASKED = 2
 
     def __init__(self, video_file: str):
         if not os.path.exists(video_file):
@@ -90,7 +76,7 @@ class Main:
         self._current_mouse_hover_frame: Optional[int] = None
         self._current_roi_region: List[int] = None
         self._message_queue: List[Tuple[float, str]] = []
-        self._mask_cache: Optional[Tuple[int, np.ndarray]] = None
+        self._mask_cache: Optional[Tuple[int, np.ndarray, np.ndarray]] = None
         self.buffer = ''
 
     @property
@@ -172,23 +158,34 @@ class Main:
     def clear_roi(self):
         self.roi = np.zeros((0, 5), dtype=int)
 
-    def load_roi(self, file: str):
+    def load_roi(self, file: str) -> np.ndarray:
         LOGGER.debug(f'load mask = {file}')
         ret: np.ndarray = np.load(file)
         # shape: (N, (time, x, y, width, height))
         if not (ret.ndim == 2 and ret.shape[1] == 5):
             raise RuntimeError('not a roi mask')
         self.roi = ret
+        return ret
 
     def save_roi(self, file: str):
         np.save(file, self.roi)
+        LOGGER.debug(f'save roi = {file}')
 
     def _get_mask_cache(self, roi: np.ndarray) -> np.ndarray:
         if self._mask_cache is None or self._mask_cache[0] != roi[0]:
-            self._mask_cache = (roi[0], rectangle_to_mask(self.video_width, self.video_height, roi))
+            mask = rectangle_to_mask(self.video_width, self.video_height, roi)
+            self._mask_cache = (roi[0], mask, mask[:, :, 0] == 255)
         return self._mask_cache[1]
 
+    def calculate_value(self, image, roi: np.ndarray) -> float:
+        self._get_mask_cache(roi)
+        _, mask_b, mask_i = self._mask_cache
+        img = cv2.cvtColor(cv2.bitwise_and(image, mask_b), cv2.COLOR_BGR2GRAY)
+
+        return np.mean(img, where=mask_i)
+
     def start(self, pause_on_start=False):
+        LOGGER.debug('start with GUI')
         vc = self._init_video()
 
         cv2.namedWindow(self.window_title, cv2.WINDOW_GUI_NORMAL)
@@ -204,10 +201,50 @@ class Main:
             cv2.destroyWindow(self.window_title)
 
     def start_no_gui(self):
+        LOGGER.debug('start no GUI')
+        if self.output_file is None:
+            raise RuntimeError('output file not set')
+
+        roi = self.load_roi(self.roi_use_file)
+        ric = roi.shape[0]
+        if ric == 0:
+            raise RuntimeError('empty ROI')
+
+        rii = -1
+
+        def get_roi():
+            nonlocal rii
+            if rii + 1 >= ric:
+                return roi[rii]
+
+            rnt = roi[rii + 1, 0]
+            if frame >= rnt:
+                rii += 1
+            if rii < 0:
+                return None
+            return roi[rii]
+
         vc = self._init_video()
+        lick_possibility = self.lick_possibility
 
         try:
-            pass
+            step = 10
+            LOGGER.debug(f'... 0% ...')
+            for frame in range(self.video_total_frames):
+                if 100 * frame / self.video_total_frames > step:
+                    LOGGER.debug(f'... {step}% ...')
+                    step += 10
+
+                ret, image = vc.read()
+                _roi = get_roi()
+                if _roi is not None:
+                    lick_possibility[frame] = self.calculate_value(image, _roi)
+                else:
+                    lick_possibility[frame] = 0
+
+            LOGGER.debug(f'... 100% ...')
+            LOGGER.debug(f'save result = {self.output_file}')
+            np.save(self.output_file, lick_possibility)
         except KeyboardInterrupt:
             pass
         finally:
@@ -260,7 +297,7 @@ class Main:
         roi = self.current_roi
 
         if roi is not None:
-            self.current_value = calculate_value(self.current_image_original, self._get_mask_cache(roi))
+            self.current_value = self.calculate_value(self.current_image_original, roi)
             self.lick_possibility[self.current_frame] = self.current_value
 
         self._show_mouse_operator_text()
@@ -539,6 +576,10 @@ if __name__ == '__main__':
     import argparse
 
     ap = argparse.ArgumentParser()
+    ap.add_argument('-x', '--execute',
+                    action='store_true',
+                    help='start no GUI mode',
+                    dest='execute')
     ap.add_argument('--roi',
                     metavar='FILE',
                     default=None,
@@ -547,19 +588,26 @@ if __name__ == '__main__':
     ap.add_argument('--save-roi',
                     metavar='FILE',
                     default=None,
-                    help='save roi path',
+                    help='save roi path, default as same as --roi',
                     dest='save_roi')
     ap.add_argument('-o', '--output', '--output-data-path',
                     metavar='FILE',
                     default=None,
                     help='save licking result',
                     dest='output')
+    ap.add_argument('-p', '--pause-on-start',
+                    action='store_true',
+                    help='pause when start',
+                    dest='pause_on_start')
     ap.add_argument('FILE')
     opt = ap.parse_args()
 
     main = Main(opt.FILE)
     main.output_file = opt.output
     main.roi_use_file = opt.use_roi
-    main.roi_output_file = opt.save_roi
+    main.roi_output_file = opt.save_roi if opt.save_roi is not None else opt.use_roi
 
-    main.start()
+    if opt.execute:
+        main.start_no_gui()
+    else:
+        main.start(pause_on_start=opt.pause_on_start)
