@@ -1,7 +1,8 @@
 import logging
 import os.path
+import threading
 import time
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Callable
 
 import cv2
 import numpy as np
@@ -12,7 +13,6 @@ logging.basicConfig(
 
 LOGGER = logging.getLogger('MiceLick')
 
-CURRENT_WINDOW_HANDLE = None
 
 COLOR_RED = (0, 0, 255)
 COLOR_YELLOW = (0, 255, 255)
@@ -74,11 +74,14 @@ class Main:
         self._is_playing = False
         self._current_operation_state = self.MOUSE_STATE_FREE
         self._current_mouse_hover_frame: Optional[int] = None
-        self._current_roi_region: List[int] = None
+        self._current_roi_region: Optional[List[int]] = None
         self._message_queue: List[Tuple[float, str]] = []
         self._mask_cache: Optional[Tuple[int, np.ndarray, np.ndarray]] = None
+        self._eval_task = None
         self.buffer = ''
-        self._key_action_dict = None
+
+    def _check_task(self) -> bool:
+        return self._eval_task is None
 
     @property
     def speed_factor(self) -> float:
@@ -117,11 +120,12 @@ class Main:
 
     @is_playing.setter
     def is_playing(self, value: bool):
-        self._is_playing = value
-        if value:
-            LOGGER.debug('play')
-        else:
-            LOGGER.debug('pause')
+        if self._check_task():
+            self._is_playing = value
+            if value:
+                LOGGER.debug('play')
+            else:
+                LOGGER.debug('pause')
 
     def enqueue_message(self, text: str):
         self._message_queue.append((time.time(), text))
@@ -177,6 +181,96 @@ class Main:
         self.enqueue_message(f'save roi = {file}')
         LOGGER.debug(f'save roi = {file}')
 
+    def eval_all_result(self):
+        if self._eval_task is not None:
+            return
+
+        if self.output_file is None:
+            raise RuntimeError('output file not set')
+
+        roi = self.load_roi(self.roi_use_file)
+        ric = roi.shape[0]
+        if ric == 0:
+            raise RuntimeError('empty ROI')
+
+        frame = self.current_frame
+
+        def before_task():
+            self.enqueue_message('start eval')
+
+        def after_task():
+            self.enqueue_message('eval done')
+            self.current_frame = frame
+
+        self._eval_task = threading.Thread(
+            name='eval thread',
+            target=self._eval_all_result,
+            args=(self.enqueue_message,),
+            kwargs=dict(
+                before=before_task,
+                after=after_task
+            )
+        )
+        self._eval_task.start()
+
+    def _eval_all_result(self,
+                         progress: Callable[[str], None] = print,
+                         before: Callable[[], None] = None,
+                         after: Callable[[], None] = None):
+
+        if before is not None:
+            before()
+
+        vc = self.video_capture
+        assert vc is not None
+
+        self._is_playing = False
+        self.eval_lick = False
+        self.current_frame = 0
+
+        roi = self.roi
+        ric = roi.shape[0]
+        assert ric != 0
+
+        rii = -1
+
+        def get_roi():
+            nonlocal rii
+            if rii + 1 >= ric:
+                return roi[rii]
+
+            rnt = roi[rii + 1, 0]
+            if frame >= rnt:
+                rii += 1
+            if rii < 0:
+                return None
+            return roi[rii]
+
+        lick_possibility = self.lick_possibility
+
+        step = 10
+        progress(f'eval 0% ...')
+        for frame in range(self.video_total_frames):
+            if 100 * frame / self.video_total_frames > step:
+                progress(f'eval {step}% ...')
+                step += 10
+
+            ret, image = vc.read()
+            self.current_image_original = image
+            _roi = get_roi()
+            if _roi is not None:
+                lick_possibility[frame] = self.calculate_value(image, _roi)
+            else:
+                lick_possibility[frame] = 0
+
+        progress(f'eval 100%')
+        self._eval_task = None
+        if after is not None:
+            after()
+
+    def clear_result(self):
+        self.lick_possibility[:] = 0
+
     def save_result(self, file: str):
         if self.lick_possibility is None:
             raise RuntimeError()
@@ -225,6 +319,9 @@ class Main:
         cv2.namedWindow(self.window_title, cv2.WINDOW_GUI_NORMAL)
         cv2.setMouseCallback(self.window_title, self.handle_mouse_event)
 
+        if self.roi_use_file is not None:
+            self.load_roi(self.roi_use_file)
+
         try:
             self._is_playing = not pause_on_start
             self._loop()
@@ -246,39 +343,10 @@ class Main:
         if ric == 0:
             raise RuntimeError('empty ROI')
 
-        rii = -1
-
-        def get_roi():
-            nonlocal rii
-            if rii + 1 >= ric:
-                return roi[rii]
-
-            rnt = roi[rii + 1, 0]
-            if frame >= rnt:
-                rii += 1
-            if rii < 0:
-                return None
-            return roi[rii]
-
         vc = self._init_video()
-        lick_possibility = self.lick_possibility
 
         try:
-            step = 10
-            LOGGER.debug(f'... 0% ...')
-            for frame in range(self.video_total_frames):
-                if 100 * frame / self.video_total_frames > step:
-                    LOGGER.debug(f'... {step}% ...')
-                    step += 10
-
-                ret, image = vc.read()
-                _roi = get_roi()
-                if _roi is not None:
-                    lick_possibility[frame] = self.calculate_value(image, _roi)
-                else:
-                    lick_possibility[frame] = 0
-
-            LOGGER.debug(f'... 100% ...')
+            self._eval_all_result(LOGGER.debug)
             self.save_result(self.output_file)
         except KeyboardInterrupt:
             pass
@@ -330,14 +398,16 @@ class Main:
 
             self.current_image_original = image
 
+        frame = self.current_frame
         self.current_image = self.current_image_original.copy()
         roi = self.current_roi
 
-        if roi is not None and self.eval_lick:
-            self.current_value = self.calculate_value(self.current_image_original, roi)
-            self.lick_possibility[self.current_frame] = self.current_value
-        else:
-            self.current_value = self.lick_possibility[self.current_frame]
+        if frame < self.video_total_frames:
+            if roi is not None and self.eval_lick:
+                self.current_value = self.calculate_value(self.current_image_original, roi)
+                self.lick_possibility[frame] = self.current_value
+            else:
+                self.current_value = self.lick_possibility[frame]
 
         self._show_queued_message()
 
@@ -519,20 +589,126 @@ class Main:
             except BaseException as e:
                 LOGGER.warning(f'command "{command}" : {e}', exc_info=1)
                 self.enqueue_message(str(e))
-        elif 32 < k < 127:  # printable
+        elif 32 <= k < 127:  # printable
             self.buffer += chr(k)
 
     def handle_command(self, command: str):
+        LOGGER.debug(f'command : {command}')
         if command == 'h':
-            self.enqueue_message('h             : print key shortcut help')
-            self.enqueue_message('q             : quit program')
-            self.enqueue_message('j             : jump to ...')
-            self.enqueue_message('d             : display ...')
-            self.enqueue_message('r             : roi ...')
-            self.enqueue_message('o             : result ...')
+            self.enqueue_message('h : print key shortcut help')
+            self.enqueue_message('q : quit program')
+            self.enqueue_message('v : video ...')
+            self.enqueue_message('j : jump to ...')
+            self.enqueue_message('d : display ...')
+            self.enqueue_message('r : roi ...')
+            self.enqueue_message('o : result ...')
 
         elif command == 'q':
             raise KeyboardInterrupt
+
+        elif command == 'o':
+            self.enqueue_message('count [sec]  : lick count within sec')
+            self.enqueue_message('eval[+-?]    : en/disable licking calculation')
+            self.enqueue_message('eval-all     : eval all licking possibility and disable calculation')
+            self.enqueue_message('clear        : clear result')
+            self.enqueue_message('save <file>  : save result')
+            self.enqueue_message('load <file>  : load result')
+            self.enqueue_message('load?        : print result output file')
+            self.enqueue_message('save?        : print result output file')
+
+        elif command.startswith('count'):
+            part: List[str] = list(filter(len, command.split(' ')))
+            if len(part) == 1:
+                t_sec = 10
+            elif len(part) == 2:
+                t_sec = int(part[1])
+            else:
+                raise ValueError()
+
+            # TODO
+            self.enqueue_message('not implemented')
+
+        elif command == 'eval-all':
+            self.eval_all_result()
+
+        elif command.startswith('eval'):
+            if command == 'eval':
+                self.eval_lick = not self.eval_lick
+            elif command == 'eval+':
+                self.eval_lick = True
+            elif command == 'eval-':
+                self.eval_lick = False
+            elif command == 'eval?':
+                pass
+            else:
+                raise ValueError(command)
+
+            self.enqueue_message('eval lick : ' + ('on' if self.eval_lick else 'off'))
+
+        elif command == 'clear':
+            self.clear_result()
+
+        elif command == 'save?':
+            self.enqueue_message(str(self.output_file))
+        elif command == 'load?':
+            self.enqueue_message(str(self.output_file))
+
+        elif command.startswith('save'):
+            part: List[str] = list(filter(len, command.split(' ')))
+            if len(part) == 1:
+                if self.output_file is not None:
+                    self.save_result(self.output_file)
+                else:
+                    self.enqueue_message('None output_file')
+            elif len(part) == 2:
+                self.output_file = part[1]
+                self.save_result(self.output_file)
+            else:
+                raise ValueError(command)
+
+        elif command.startswith('load'):
+            part: List[str] = list(filter(len, command.split(' ')))
+            if len(part) == 1:
+                if self.output_file is not None:
+                    self.load_result(self.output_file)
+                else:
+                    self.enqueue_message('None output_file')
+            elif len(part) == 2:
+                self.output_file = part[1]
+                self.load_result(self.output_file)
+            else:
+                raise ValueError(command)
+
+        elif command == 'v':
+            self.enqueue_message('va : print all video information below')
+            self.enqueue_message('vp : print video file path')
+            self.enqueue_message('vw : print video width')
+            self.enqueue_message('vh : print video height')
+            self.enqueue_message('vf : print video fps')
+            self.enqueue_message('vd : print video duration')
+            self.enqueue_message('vt : print video total frame')
+            self.enqueue_message('vc : print current frame')
+
+        elif command.startswith('v'):
+            if command == 'va':
+                command = 'pwhfdt'
+            else:
+                command = command[1:]
+
+            if 'p' in command:
+                self.enqueue_message(f'path : {self.video_file}')
+            if 'w' in command:
+                self.enqueue_message(f'width : {self.video_width}')
+            if 'h' in command:
+                self.enqueue_message(f'height : {self.video_height}')
+            if 'f' in command:
+                self.enqueue_message(f'fps : {self.video_fps}')
+            if 'd' in command:
+                self.enqueue_message(f'time : {self._frame_to_text(self.video_total_frames)}')
+            if 't' in command:
+                self.enqueue_message(f'total : {self.video_total_frames}')
+            if 'c' in command:
+                self.enqueue_message(f'frame : {self.current_frame}')
 
         elif command == 'j':
             self.enqueue_message('j<sec>        : jump to <sec> time')
@@ -553,9 +729,9 @@ class Main:
                 LOGGER.debug(f'jump to {t_min:02d}:{t_sec:02d} (frame={frame})')
 
         elif command == 'd':
-            self.enqueue_message('dtime[+-?]    : display time line')
-            self.enqueue_message('dlick[+-?]    : display lick curve')
-            self.enqueue_message('droi[+-?]     : display roi rectangle')
+            self.enqueue_message('dtime[+-?] : display time line')
+            self.enqueue_message('dlick[+-?] : display lick curve')
+            self.enqueue_message('droi[+-?]  : display roi rectangle')
 
         elif command.startswith('dtime'):
             if command == 'dtime':
@@ -604,7 +780,8 @@ class Main:
             self.enqueue_message('ra            : print all roi information')
             self.enqueue_message('r<idx>j       : jump to <idx> roi time')
             self.enqueue_message('r<idx>d       : delete <idx> roi')
-            self.enqueue_message('rdd           : delete all roi')
+            self.enqueue_message('rad           : delete all roi')
+            self.enqueue_message('r+ x y x y [t] : add roi')
             self.enqueue_message('rload <file>  : load roi')
             self.enqueue_message('rload?        : print use roi file')
             self.enqueue_message('rsave <file>  : save roi')
@@ -632,8 +809,19 @@ class Main:
         elif command.startswith('r') and command.endswith('d'):
             self.del_roi(int(command[1:-1]))
 
-        elif command == 'rdd':
+        elif command == 'rad':
             self.clear_roi()
+
+        elif command.startswith('r+'):
+            part: List[str] = list(filter(len, command.split(' ')))
+            x0 = int(part[1])
+            y0 = int(part[2])
+            x1 = int(part[3])
+            y1 = int(part[4])
+            t = int(part[5]) if len(part) == 6 else self.current_frame
+            if len(part) > 6:
+                raise ValueError(command)
+            self.add_roi(x0, y0, x1, y1, t)
 
         elif command == 'rsave?':
             self.enqueue_message(str(self.roi_output_file))
@@ -651,7 +839,7 @@ class Main:
                 self.roi_output_file = part[1]
                 self.save_roi(self.roi_output_file)
             else:
-                raise ValueError()
+                raise ValueError(command)
 
         elif command.startswith('rload'):
             part: List[str] = list(filter(len, command.split(' ')))
@@ -664,63 +852,7 @@ class Main:
                 self.roi_use_file = part[1]
                 self.load_roi(self.roi_use_file)
             else:
-                raise ValueError()
-
-        elif command == 'o':
-            self.enqueue_message('oeval[+-?]    : en/disable licking calculation')
-            self.enqueue_message('oclear        : clear result')
-            self.enqueue_message('osave <file>  : save result')
-            self.enqueue_message('oload <file>  : load result')
-            self.enqueue_message('rload?        : print result output file')
-            self.enqueue_message('rsave?        : print result output file')
-
-        elif command.startswith('oeval'):
-            if command == 'oeval':
-                self.eval_lick = not self.eval_lick
-            elif command == 'oeval+':
-                self.eval_lick = True
-            elif command == 'oeval-':
-                self.eval_lick = False
-            elif command == 'oeval?':
-                pass
-            else:
                 raise ValueError(command)
-
-            self.enqueue_message('eval lick : ' + ('on' if self.eval_lick else 'off'))
-
-        elif command == 'oclear':
-            self.lick_possibility[:] = 0
-
-        elif command == 'osave?':
-            self.enqueue_message(str(self.output_file))
-        elif command == 'oload?':
-            self.enqueue_message(str(self.output_file))
-
-        elif command.startswith('osave'):
-            part: List[str] = list(filter(len, command.split(' ')))
-            if len(part) == 1:
-                if self.output_file is not None:
-                    self.save_result(self.output_file)
-                else:
-                    self.enqueue_message('None output_file')
-            elif len(part) == 2:
-                self.output_file = part[1]
-                self.save_result(self.output_file)
-            else:
-                raise ValueError()
-
-        elif command.startswith('oload'):
-            part: List[str] = list(filter(len, command.split(' ')))
-            if len(part) == 1:
-                if self.output_file is not None:
-                    self.load_result(self.output_file)
-                else:
-                    self.enqueue_message('None output_file')
-            elif len(part) == 2:
-                self.output_file = part[1]
-                self.load_result(self.output_file)
-            else:
-                raise ValueError()
 
         else:
             # self.enqueue_message('q             : quit program')
