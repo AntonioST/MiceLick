@@ -13,9 +13,9 @@ Troubleshooting
 
 * How to close window? I cannot close window by click window close (X) button.
 
-press keyboard 'q' to quit
+press keyboard 'q' and press enter to quit
 program [ref](https://stackoverflow.com/questions/13307606/closing-video-window-using-close-x-button-in-opencv-python).
 
 * What are those keyboard shortcut?
 
-press keyboard 'h' to print the document on terminal.
+press keyboard 'h' and press enter to print the document on terminal.
