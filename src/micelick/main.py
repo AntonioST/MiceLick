@@ -587,7 +587,7 @@ class Main:
             except KeyboardInterrupt:
                 raise
             except BaseException as e:
-                LOGGER.warning(f'command "{command}" : {e}', exc_info=1)
+                LOGGER.warning(f'command "{command}" : {e}', exc_info=True)
                 self.enqueue_message(str(e))
         elif 32 <= k < 127:  # printable
             self.buffer += chr(k)
@@ -713,20 +713,42 @@ class Main:
         elif command == 'j':
             self.enqueue_message('j<sec>        : jump to <sec> time')
             self.enqueue_message('j<min>:<sec>  : jump to <min>:<sec> time')
+            self.enqueue_message('j[-+][<min>:]<sec> : jump to back/forward time')
             self.enqueue_message('jend          : jump to END')
+            self.enqueue_message('jr            : jump to current roi time')
             self.enqueue_message('jr<idx>       : jump to <idx> roi time')
 
+        elif command == 'jend':
+            self.current_frame = self.video_total_frames - 1
+            LOGGER.debug(f'jump to END')
+
+        elif command == 'jr':
+            self.handle_command('rj')
+
+        elif command.startswith('jr'):
+            self.handle_command(f'r{int(command[2:])}j')
+
         elif command.startswith('j'):
-            if command == 'jend':
-                self.current_frame = self.video_total_frames - 1
-                LOGGER.debug(f'jump to END')
-            elif command.startswith('jr'):
-                self.handle_command(f'r{int(command[2:])}j')
+            if command.startswith('j+'):
+                relative = 1
+                command = command[2:]
+            elif command.startswith('j-'):
+                relative = -1
+                command = command[2:]
             else:
-                t_min, t_sec = _decode_buffer_as_time(command[1:])
-                frame = (t_min * 60 + t_sec) * self.video_fps
+                relative = 0
+                command = command[1:]
+
+            t_min, t_sec = _decode_buffer_as_time(command)
+            frame = (t_min * 60 + t_sec) * self.video_fps
+            if relative == 0:
                 self.current_frame = frame
-                LOGGER.debug(f'jump to {t_min:02d}:{t_sec:02d} (frame={frame})')
+            else:
+                frame = self.current_frame + relative * frame
+                self.current_frame = frame
+                t_min, t_sec = frame // 60, frame % 60
+
+            LOGGER.debug(f'jump to {t_min:02d}:{t_sec:02d} (frame={frame})')
 
         elif command == 'd':
             self.enqueue_message('dtime[+-?] : display time line')
@@ -778,8 +800,8 @@ class Main:
         elif command == 'r':
             self.enqueue_message('rp            : print current roi information')
             self.enqueue_message('ra            : print all roi information')
-            self.enqueue_message('r<idx>j       : jump to <idx> roi time')
-            self.enqueue_message('r<idx>d       : delete <idx> roi')
+            self.enqueue_message('r[<idx>]j     : jump to current/<idx> roi time')
+            self.enqueue_message('r[<idx>]d     : delete current/<idx> roi')
             self.enqueue_message('rad           : delete all roi')
             self.enqueue_message('r+ x y x y [t] : add roi')
             self.enqueue_message('rload <file>  : load roi')
@@ -801,13 +823,29 @@ class Main:
                     self.enqueue_message(f' roi[{idx}] t={roi[0]} ({roi[1]},{roi[2]}).({roi[3]},{roi[4]})')
 
         elif command.startswith('r') and command.endswith('j'):
-            idx = int(command[1:-1])
-            frame = self.roi[idx, 0]
+            if command == 'rj':
+                frame = self.current_roi[0]
+                idx = np.nonzero(self.roi[:, 0] == frame)[0][0]
+            else:
+                idx = int(command[1:-1])
+                frame = self.roi[idx, 0]
+
             self.current_frame = frame
             LOGGER.debug(f'jump to roi[{idx}] (frame={frame})')
 
+        elif command == 'rd':
+            frame = self.current_roi[0]
+            idx = np.nonzero(self.roi[:, 0] == frame)[0][0]
+            self.del_roi(idx)
+
         elif command.startswith('r') and command.endswith('d'):
-            self.del_roi(int(command[1:-1]))
+            if command == 'rd':
+                frame = self.current_roi[0]
+                idx = np.nonzero(self.roi[:, 0] == frame)[0][0]
+            else:
+                idx = int(command[1:-1])
+
+            self.del_roi(idx)
 
         elif command == 'rad':
             self.clear_roi()
