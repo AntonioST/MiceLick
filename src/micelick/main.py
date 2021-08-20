@@ -42,6 +42,7 @@ class Main:
         self.output_file: Optional[str] = None
         self.roi_use_file: Optional[str] = None
         self.roi_output_file: Optional[str] = None
+        self._output_file_saved = False
 
         # lick properties
         self.current_value = 0
@@ -265,13 +266,15 @@ class Main:
 
         progress(f'eval 100%')
         self._eval_task = None
+        self._output_file_saved = False
         if after is not None:
             after()
 
     def clear_result(self):
         self.lick_possibility[:] = 0
+        self._output_file_saved = False
 
-    def save_result(self, file: str):
+    def save_result(self, file: str, save_all=False):
         if self.lick_possibility is None:
             raise RuntimeError()
 
@@ -285,7 +288,23 @@ class Main:
         for roi in self.roi:
             data[:, roi[0]:] += 1
 
-        np.save(file, data)
+        if save_all or not os.path.exists(file):
+            np.save(file, data)
+        else:
+            # overwrite non-zero time
+            # TODO not test
+            disk_data = np.load(file)
+            if disk_data.shape != data.shape:
+                # save all if shape does not agree
+                np.save(file, data)
+            else:
+                mask = self.lick_possibility > 0
+                disk_data[:, 0] = data[:, 0]
+                disk_data[mask, 1] = data[mask, 1]
+                disk_data[mask, 2] = data[mask, 2]
+                np.save(file, disk_data)
+
+        self._output_file_saved = True
         self.enqueue_message(f'save result = {file}')
         LOGGER.debug(f'save result = {file}')
 
@@ -298,6 +317,7 @@ class Main:
             raise RuntimeError('result file not match to current video')
 
         self.lick_possibility = data[:, 2].copy()
+        self._output_file_saved = True
 
     def _get_mask_cache(self, roi: np.ndarray) -> np.ndarray:
         if self._mask_cache is None or self._mask_cache[0] != roi[0]:
@@ -370,6 +390,7 @@ class Main:
         LOGGER.debug(f'total_frame = {f}')
 
         self.lick_possibility = np.zeros((self.video_total_frames,), float)
+        self._output_file_saved = False
 
         return vc
 
@@ -406,6 +427,7 @@ class Main:
             if roi is not None and self.eval_lick:
                 self.current_value = self.calculate_value(self.current_image_original, roi)
                 self.lick_possibility[frame] = self.current_value
+                self._output_file_saved = False
             else:
                 self.current_value = self.lick_possibility[frame]
 
@@ -604,6 +626,24 @@ class Main:
             self.enqueue_message('o : result ...')
 
         elif command == 'q':
+            if self._output_file_saved or self.output_file is None:
+                raise KeyboardInterrupt
+
+            self.enqueue_message('result not saved.')
+            self.enqueue_message('qq : force quit')
+            self.enqueue_message('wq : save and quit')
+
+        elif command == 'qq':
+            raise KeyboardInterrupt
+
+        elif command == 'wq':
+            if not self._output_file_saved:
+                if self.output_file is not None:
+                    self.save_result(self.output_file)
+                else:
+                    self.enqueue_message('None output_file, abort quiting')
+                    return
+
             raise KeyboardInterrupt
 
         elif command == 'o':
