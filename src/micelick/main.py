@@ -13,7 +13,7 @@ logging.basicConfig(
 
 LOGGER = logging.getLogger('MiceLick')
 
-
+# predefined color
 COLOR_RED = (0, 0, 255)
 COLOR_YELLOW = (0, 255, 255)
 COLOR_GREEN = (0, 255, 0)
@@ -23,6 +23,23 @@ COLOR_BLACK = (255, 255, 255)
 
 
 def rectangle_to_mask(w: int, h: int, roi: np.ndarray) -> np.ndarray:
+    """
+
+    Parameters
+    ----------
+    w
+        view width
+    h
+        view height
+    roi
+        region of interest with shape (fame, x0, y0, x1, y1)
+
+    Returns
+    -------
+    mask
+        mask of view. foreground=black, background=white
+
+    """
     ret = np.zeros((h, w, 3), dtype=np.uint8)
     _, x0, y0, x1, y1 = roi
     cv2.rectangle(ret, (x0, y0), (x1, y1), COLOR_BLACK, -1, cv2.LINE_AA)
@@ -30,74 +47,107 @@ def rectangle_to_mask(w: int, h: int, roi: np.ndarray) -> np.ndarray:
 
 
 class Main:
-    MOUSE_STATE_FREE = 0
-    MOUSE_STATE_MASKING = 1
+    """GUI"""
+
+    # mouse state
+    MOUSE_STATE_FREE = 0  # mouse free moving
+    MOUSE_STATE_ROI = 1  # mouse dragging, making roi.
 
     def __init__(self, video_file: str):
+        """
+
+        Parameters
+        ----------
+        video_file
+            video source file path
+
+        Raises
+        ------
+        FileNotFoundError
+            video_file isn't existed.
+        """
         if not os.path.exists(video_file):
             raise FileNotFoundError(video_file)
 
-        # file
+        # file path
         self.video_file = video_file
         self.output_file: Optional[str] = None
         self.roi_use_file: Optional[str] = None
         self.roi_output_file: Optional[str] = None
-        self._output_file_saved = False
+        self._output_file_saved = False  # indicate output_file is saved.
 
         # lick properties
-        self.current_value = 0
-        self.lick_possibility: np.ndarray = None
+        self.current_value = 0  # = lick_possibility[current_frame], updated on each frame.
+        self.lick_possibility: np.ndarray = None  # shape (total_frames,)
 
         # display properties
-        self.window_title = 'MouseLicking'
-        self.roi: np.ndarray = np.zeros((0, 5), dtype=int)
-        self.show_time = True
-        self.show_lick = True
-        self.show_lick_duration = 30
-        self.show_roi = True
-        self.eval_lick = True
-        self.mouse_stick_to_roi = True
-        self.mouse_stick_distance = 5
-        self.message_fade_time = 5
+        self.window_title = 'MouseLicking'  # window title.
+        self.roi: np.ndarray = np.zeros((0, 5), dtype=int)  # [fame, x0, y0, x1, y1]
+        self.show_time = True  # show time bar
+        self.show_lick = True  # show lick possibility curve
+        self.show_lick_duration = 30  # duration of lick possibility curve
+        self.show_roi = True  # show roi rectangle
+        self.eval_lick = True  # evaluate lick possibility on each frame
+        self.mouse_stick_to_roi = True  # stick mouse to roi frame on time bar
+        self.mouse_stick_distance = 5  # diameter of region to stick mouse on roi frame on time bar
+        self.message_fade_time = 5  # duration of the message start fading
 
         # video property
-        self.video_capture: cv2.VideoCapture = None
+        self.video_capture: cv2.VideoCapture = None  # opencv object
         self.video_width: int = 0
         self.video_height: int = 0
         self.video_fps: int = 1
         self.video_total_frames: int = 0
-        self.current_image_original = None
-        self.current_image = None
+        self.current_image = None  # current frame image from video_capture
 
         # control
-        self._speed_factor: float = 1
-        self._sleep_interval = 1
-        self._is_playing = False
-        self._current_operation_state = self.MOUSE_STATE_FREE
-        self._current_mouse_hover_frame: Optional[int] = None
-        self._current_roi_region: Optional[List[int]] = None
-        self._message_queue: List[Tuple[float, str]] = []
-        self._mask_cache: Optional[Tuple[int, np.ndarray, np.ndarray]] = None
-        self._eval_task = None
-        self.buffer = ''
-
-    def _check_task(self) -> bool:
-        return self._eval_task is None
+        self._speed_factor: float = 1  # playing speed factor
+        self._sleep_interval = 1  # playing FPS control
+        self._is_playing = False  # play/pause
+        self._current_operation_state = self.MOUSE_STATE_FREE  # mouse state
+        self._current_mouse_hover_frame: Optional[int] = None  # mouse point frame on time bar.
+        self._current_roi_region: Optional[List[int]] = None  # roi when roi making
+        self._message_queue: List[Tuple[float, str]] = []  # message queue
+        self._mask_cache: Optional[Tuple[int, np.ndarray, np.ndarray]] = None  # mask cache.
+        self._eval_task = None  # evaluation thread.
+        self.buffer = ''  # input buffer
 
     @property
     def speed_factor(self) -> float:
+        """playing speed factor"""
         return self._speed_factor
 
     @speed_factor.setter
     def speed_factor(self, value: float):
+        """
+        change playing speed factor.
+
+        Parameters
+        ----------
+        value
+            playing speed factor. value range from (0.25, 32).
+        """
         value = min(32.0, max(0.25, value))
         self._speed_factor = value
         self._sleep_interval = 1 / self.video_fps / value
-        self.enqueue_message(f'x{value}')
+        self.enqueue_message(f'speed x{value}')
         LOGGER.debug(f'speed = {value}')
 
     @property
     def current_frame(self) -> int:
+        """
+
+        Returns
+        -------
+        frame
+            current frame number.
+
+        Raises
+        ------
+        RuntimeError
+            video file doesn't open yet.
+
+        """
         vc = self.video_capture
         if vc is None:
             raise RuntimeError()
@@ -105,6 +155,21 @@ class Main:
 
     @current_frame.setter
     def current_frame(self, value: int):
+        """set/jump to frame.
+
+        Parameters
+        ----------
+        value
+            frame number.
+
+        Raises
+        -------
+        RuntimeError
+            video file doesn't open yet.
+        ValueError
+            frame value out of range.
+
+        """
         vc = self.video_capture
         if vc is None:
             raise RuntimeError()
@@ -113,15 +178,27 @@ class Main:
             raise ValueError()
 
         vc.set(cv2.CAP_PROP_POS_FRAMES, value)
-        self.current_image_original = None
+        self.current_image = None
 
     @property
     def is_playing(self) -> bool:
+        """is playing?"""
         return self._is_playing
 
     @is_playing.setter
     def is_playing(self, value: bool):
-        if self._check_task():
+        """
+        set playing or pause.
+
+        Ignored when evaluation job is working.
+
+        Parameters
+        ----------
+        value
+            True for playing, False for pausing.
+
+        """
+        if self._eval_task is None:
             self._is_playing = value
             if value:
                 LOGGER.debug('play')
@@ -129,17 +206,48 @@ class Main:
                 LOGGER.debug('pause')
 
     def enqueue_message(self, text: str):
+        """
+        enqueue message to queue.
+
+        Parameters
+        ----------
+        text
+            message
+
+        """
         self._message_queue.append((time.time(), text))
 
     @property
     def roi_count(self) -> int:
+        """total roi number"""
         return self.roi.shape[0]
 
     @property
     def current_roi(self) -> Optional[np.ndarray]:
+        """current using roi according to current frame"""
         return self.get_roi(self.current_frame)
 
     def get_roi(self, frame: int) -> Optional[np.ndarray]:
+        """
+        get roi according to frame.
+
+        Parameters
+        ----------
+        frame
+            frame number.
+
+        Returns
+        -------
+        roi
+
+        Raises
+        -------
+        ValueError
+            frame value out of range.
+        """
+        if not (0 <= frame < self.video_total_frames):
+            raise ValueError()
+
         ret = None
         for mask in self.roi:
             t = mask[0]
@@ -148,6 +256,21 @@ class Main:
         return ret
 
     def add_roi(self, x0: int, y0: int, x1: int, y1: int, t: int = None):
+        """
+        add roi.
+
+        If there is existed a roi at time t, then replace it with new one.
+
+        Parameters
+        ----------
+        x0
+        y0
+        x1
+        y1
+        t
+            frame number. If None, use current frame number.
+
+        """
         if t is None:
             t = self.current_frame
 
@@ -159,14 +282,38 @@ class Main:
         LOGGER.info(f'add roi [{t},{x0},{y0},{x1},{y1}]')
 
     def del_roi(self, index: int):
+        """
+        delete roi at index.
+
+        Parameters
+        ----------
+        index
+            index of roi.
+
+        """
         t, x0, y0, x1, y1 = self.roi[index]
         self.roi = np.delete(self.roi, index, axis=0)
         LOGGER.info(f'del roi [{t},{x0},{y0},{x1},{y1}]')
 
     def clear_roi(self):
+        """clear all roi"""
         self.roi = np.zeros((0, 5), dtype=int)
 
     def load_roi(self, file: str) -> np.ndarray:
+        """
+        load roi from file.
+
+        Parameters
+        ----------
+        file
+            roi file, in npy format.
+
+        Returns
+        -------
+        roi
+            loaded roi.
+
+        """
         LOGGER.debug(f'load roi = {file}')
         ret: np.ndarray = np.load(file)
 
@@ -178,11 +325,30 @@ class Main:
         return ret
 
     def save_roi(self, file: str):
+        """
+        save roi into file.
+
+        Parameters
+        ----------
+        file
+            roi file, in npy format.
+
+        """
         np.save(file, self.roi)
         self.enqueue_message(f'save roi = {file}')
         LOGGER.debug(f'save roi = {file}')
 
     def eval_all_result(self):
+        """
+        start an evaluation job and evaluate all lock possibility along the video.
+
+        Do nothing when previous job hasn't finished.
+
+        Raises
+        ------
+        RuntimeError
+            output file not set, or no roi.
+        """
         if self._eval_task is not None:
             return
 
@@ -218,7 +384,27 @@ class Main:
                          progress: Callable[[str], None] = print,
                          before: Callable[[], None] = None,
                          after: Callable[[], None] = None):
+        """
+        evaluation job.
 
+        Ensure video capture has inited (by `_init_video`).
+        Ensure roi is set (not empty).
+
+        During task, property is_playing is frozen,
+
+        During task, lick_possibility, current_image and current_frame will be modified.
+        Don't touch them during task.
+
+        Parameters
+        ----------
+        progress
+            progress message callback, with format "eval {percentage}% ..."
+        before
+            callback before job start.
+        after
+            callback after job finished.
+
+        """
         if before is not None:
             before()
 
@@ -257,7 +443,7 @@ class Main:
                 step += 10
 
             ret, image = vc.read()
-            self.current_image_original = image
+            self.current_image = image
             _roi = get_roi()
             if _roi is not None:
                 lick_possibility[frame] = self.calculate_value(image, _roi)
@@ -271,10 +457,29 @@ class Main:
             after()
 
     def clear_result(self):
+        """clear licking possibility"""
         self.lick_possibility[:] = 0
         self._output_file_saved = False
 
     def save_result(self, file: str, save_all=False):
+        """
+        save licking possibility into file.
+
+        **data format**
+
+        (T, 3) array, which T is total frame number.
+        column 0: time in second
+        column 1: roi index used
+        column 2: licking possibility
+
+        Parameters
+        ----------
+        file
+            result file in npy format
+        save_all
+            write all of the data into file, instead of non-zero value.
+
+        """
         if self.lick_possibility is None:
             raise RuntimeError()
 
@@ -309,6 +514,23 @@ class Main:
         LOGGER.debug(f'save result = {file}')
 
     def load_result(self, file: str):
+        """
+        load licking possibility from file.
+
+        Parameters
+        ----------
+        file
+            result file in npy format
+
+        Returns
+        -------
+
+        Raises
+        ------
+        RuntimeError
+            data shape not correct.
+
+        """
         size = self.video_total_frames
 
         LOGGER.debug(f'load result = {file}')
@@ -319,20 +541,55 @@ class Main:
         self.lick_possibility = data[:, 2].copy()
         self._output_file_saved = True
 
-    def _get_mask_cache(self, roi: np.ndarray) -> np.ndarray:
+    def _get_mask_cache(self, roi: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        get mask cache for roi.
+
+        Parameters
+        ----------
+        roi
+
+        Returns
+        -------
+        mask
+            opencv image mask
+        mask
+            numpy array mask
+        """
+        # check cache time.
         if self._mask_cache is None or self._mask_cache[0] != roi[0]:
             mask = rectangle_to_mask(self.video_width, self.video_height, roi)
             self._mask_cache = (roi[0], mask, mask[:, :, 0] == 255)
-        return self._mask_cache[1]
+        return self._mask_cache[1], self._mask_cache[1]
 
     def calculate_value(self, image, roi: np.ndarray) -> float:
-        self._get_mask_cache(roi)
-        _, mask_b, mask_i = self._mask_cache
+        """
+        calculate lick possibility in roi for image.
+
+        Parameters
+        ----------
+        image
+        roi
+
+        Returns
+        -------
+        possibility
+
+        """
+        mask_b, mask_i = self._get_mask_cache(roi)
         img = cv2.cvtColor(cv2.bitwise_and(image, mask_b), cv2.COLOR_BGR2GRAY)
 
         return np.mean(img, where=mask_i)
 
     def start(self, pause_on_start=False):
+        """
+        start GUI.
+
+        Parameters
+        ----------
+        pause_on_start
+
+        """
         LOGGER.debug('start with GUI')
         vc = self._init_video()
 
@@ -354,6 +611,10 @@ class Main:
             LOGGER.debug('closed')
 
     def start_no_gui(self):
+        """
+        start in no-GUI mode, evaluate all lick possibility.
+        In this mode, all of the resource should be ready.
+        """
         LOGGER.debug('start no GUI')
         if self.output_file is None:
             raise RuntimeError('output file not set')
@@ -376,6 +637,7 @@ class Main:
             LOGGER.debug('closed')
 
     def _init_video(self) -> cv2.VideoCapture:
+        """initialize video capture and related attributes"""
         LOGGER.debug(f'file = {self.video_file}')
         self.video_capture = vc = cv2.VideoCapture(self.video_file)
         self.video_width = w = int(vc.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -395,6 +657,7 @@ class Main:
         return vc
 
     def _loop(self):
+        """frame update look."""
         while True:
             t = time.time()
             try:
@@ -410,78 +673,94 @@ class Main:
                 time.sleep(t)
 
     def _update(self):
+        """frame update"""
+
         vc = self.video_capture
-        if self._is_playing or self.current_image_original is None:
+
+        # get image
+        if self._is_playing or self.current_image is None:
             ret, image = vc.read()
             if not ret:
                 self._is_playing = False
                 return
 
-            self.current_image_original = image
+            self.current_image = image
 
+        # copy image for UI drawing.
+        image = self.current_image.copy()
         frame = self.current_frame
-        self.current_image = self.current_image_original.copy()
         roi = self.current_roi
 
-        if frame < self.video_total_frames:
-            if roi is not None and self.eval_lick:
-                self.current_value = self.calculate_value(self.current_image_original, roi)
+        if frame < self.video_total_frames:  # not end of frame.
+            # realtime evaluate lick possibility
+            if roi is not None and self.eval_lick and self._eval_task is None:
+                self.current_value = self.calculate_value(self.current_image, roi)
                 self.lick_possibility[frame] = self.current_value
                 self._output_file_saved = False
-            else:
+            else:  # or read value from result.
                 self.current_value = self.lick_possibility[frame]
 
-        self._show_queued_message()
-
+        # show input buffer content
         if len(self.buffer):
-            self._show_buffer()
+            self._show_buffer(image)
 
-        if self._current_roi_region is not None:
-            self._show_roi_tmp()
-        elif self.show_roi:
+        # display enqueued message
+        self._show_queued_message(image)
+
+        # drawing roi
+        if self._current_roi_region is not None:  # when a roi is creating, draw it first
+            self._show_roi_tmp(image)
+        elif self.show_roi:  # then current roi.
             if roi is not None:
-                self._show_roi(roi)
+                self._show_roi(image, roi)
 
+        # show lick possibility curve
         if self.show_lick and self.lick_possibility is not None and roi is not None:
-            self._show_lick_possibility()
+            self._show_lick_possibility(image)
 
+        # show time bar
         if self.show_time:
-            self._show_time_bar()
+            self._show_time_bar(image)
 
-        cv2.imshow(self.window_title, self.current_image)
+        # update frame
+        cv2.imshow(self.window_title, image)
 
+        # get keyboard input.
         k = cv2.waitKey(1)
         if k > 0:
             self.handle_key_event(k)
 
-    def _show_queued_message(self):
+    def _show_queued_message(self, image):
+        """drawing enqueued message"""
         t = time.time()
         y = 70
         s = 25
         i = 0
         while i < len(self._message_queue):
             r, m = self._message_queue[i]
-            if r + self.message_fade_time < t:
+            if r + self.message_fade_time < t:  # message has showed enough time, so we delete it.
                 del self._message_queue[i]
             else:
-                cv2.putText(self.current_image, m, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
+                cv2.putText(image, m, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
                 i += 1
                 y += s
 
-    def _show_buffer(self):
-        h = self.video_height
-        buffer = self.buffer
-        cv2.putText(self.current_image, buffer, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
+    def _show_buffer(self, image):
+        """drawing input buffer content"""
+        cv2.putText(image, self.buffer, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
-    def _show_roi(self, roi: np.ndarray):
+    def _show_roi(self, image, roi: np.ndarray):
+        """drawing roi"""
         _, x0, y0, x1, y1 = roi
-        cv2.rectangle(self.current_image, (x0, y0), (x1, y1), COLOR_YELLOW, 2, cv2.LINE_AA)
+        cv2.rectangle(image, (x0, y0), (x1, y1), COLOR_YELLOW, 2, cv2.LINE_AA)
 
-    def _show_roi_tmp(self):
+    def _show_roi_tmp(self, image):
+        """drawing making roi"""
         x0, y0, x1, y1 = self._current_roi_region
-        cv2.rectangle(self.current_image, (x0, y0), (x1, y1), COLOR_GREEN, 2, cv2.LINE_AA)
+        cv2.rectangle(image, (x0, y0), (x1, y1), COLOR_GREEN, 2, cv2.LINE_AA)
 
-    def _show_lick_possibility(self):
+    def _show_lick_possibility(self, image):
+        """drawing lick possibility curve"""
         s = 130
         w = self.video_width
         h = self.video_height
@@ -489,12 +768,13 @@ class Main:
         y0 = h - 30
         length = w - 2 * s
 
+        # duration
         duration = (self.show_lick_duration * self.video_fps) // 2
         f0 = max(0, frame - duration)
-
-        cv2.putText(self.current_image, f'-{self.show_lick_duration} s', (10, y0),
+        cv2.putText(image, f'-{self.show_lick_duration} s', (10, y0),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
+        # possibility curve
         if f0 != frame:
             # FIXME not work properly
             v = self.lick_possibility[f0:frame]
@@ -504,40 +784,42 @@ class Main:
             y = y0 - 20 * y.astype(np.int32)
             x = np.linspace(s, w - s, length, dtype=np.int32)
             p = np.vstack((x, y)).transpose()
-            cv2.polylines(self.current_image, [p], 0, COLOR_RED, 2, cv2.LINE_AA)
+            cv2.polylines(image, [p], 0, COLOR_RED, 2, cv2.LINE_AA)
         else:
-            cv2.line(self.current_image, (s, y0), (w - s, y0), COLOR_RED, 1, cv2.LINE_AA)
+            cv2.line(image, (s, y0), (w - s, y0), COLOR_RED, 1, cv2.LINE_AA)
 
+        # lick possibility value
         if self.current_value is not None:
-            cv2.putText(self.current_image, f'{self.current_value:01.2f}', (w - 100, y0),
+            cv2.putText(image, f'{self.current_value:01.2f}', (w - 100, y0),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
-    def _show_time_bar(self):
+    def _show_time_bar(self, image):
+        """drawing time bar"""
         s = 130
         w = self.video_width
         h = self.video_height
         frame = self.current_frame
 
         # total frame text
-        cv2.putText(self.current_image, self._frame_to_text(self.video_total_frames), (w - 100, h),
+        cv2.putText(image, self._frame_to_text(self.video_total_frames), (w - 100, h),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
         # current frame text
-        cv2.putText(self.current_image, self._frame_to_text(frame), (10, h),
+        cv2.putText(image, self._frame_to_text(frame), (10, h),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
         # line
-        cv2.line(self.current_image, (s, h - 10), (w - s, h - 10), COLOR_RED, 3, cv2.LINE_AA)
+        cv2.line(image, (s, h - 10), (w - s, h - 10), COLOR_RED, 3, cv2.LINE_AA)
 
         #
         # roi frame
         mx = self._frame_to_time_bar_x(self.roi[:, 0])
         for x in mx:
-            cv2.line(self.current_image, (x, h - 20), (x, h), COLOR_YELLOW, 3, cv2.LINE_AA)
+            cv2.line(image, (x, h - 20), (x, h), COLOR_YELLOW, 3, cv2.LINE_AA)
 
         # current frame
         x = self._frame_to_time_bar_x(frame)
-        cv2.line(self.current_image, (x, h - 20), (x, h), COLOR_RED, 3, cv2.LINE_AA)
+        cv2.line(image, (x, h - 20), (x, h), COLOR_RED, 3, cv2.LINE_AA)
 
         # mouse hover
         if self._current_mouse_hover_frame is not None:
@@ -551,13 +833,25 @@ class Main:
                     self._current_mouse_hover_frame = int(self.roi[i, 0])
                     color = COLOR_YELLOW
 
-            cv2.line(self.current_image, (x, h - 20), (x, h), color, 3, cv2.LINE_AA)
+            cv2.line(image, (x, h - 20), (x, h), color, 3, cv2.LINE_AA)
 
             # text
-            cv2.putText(self.current_image, self._frame_to_text(self._current_mouse_hover_frame), (x - s // 2, h - 20),
+            cv2.putText(image, self._frame_to_text(self._current_mouse_hover_frame), (x - s // 2, h - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2, cv2.LINE_AA)
 
-    def _set_mouse_hover_frame(self, x, y):
+    def _set_mouse_hover_frame(self, x: int, y: int):
+        """
+        calculate the frame where the mouse point on.
+        Then update _current_mouse_hover_frame.
+
+        Parameters
+        ----------
+        x
+            mouse x
+        y
+            mouse y
+
+        """
         w = self.video_width
         h = self.video_height
         t = self.video_total_frames
@@ -569,11 +863,29 @@ class Main:
             self._current_mouse_hover_frame = None
 
     def _frame_to_time_bar_x(self, frame):
+        """
+        calculate the position for the frame on time bar.
+
+        Parameters
+        ----------
+        frame : int or np.ndarray
+            frame number.
+
+        Returns
+        -------
+        x
+            x value
+
+        Raises
+        ------
+        TypeError
+
+        """
         w = self.video_width
         t = self.video_total_frames
         s = 130
 
-        if isinstance(frame, (int, float)):
+        if isinstance(frame, int):
             return int((w - 2 * s) * frame / t) + s
         elif isinstance(frame, np.ndarray):
             return ((w - 2 * s) * frame.astype(float) / t).astype(int) + s
@@ -581,11 +893,42 @@ class Main:
             raise TypeError(type(frame))
 
     def _frame_to_text(self, frame: int):
+        """
+        convert frame to time text, which format '{minute:02d}:{second:02d}'
+
+        Parameters
+        ----------
+        frame
+            frame number
+
+        Returns
+        -------
+        time_text
+
+        """
         t_sec = frame // self.video_fps
         t_min, t_sec = t_sec // 60, t_sec % 60
         return f'{t_min:02d}:{t_sec:02d}'
 
     def handle_key_event(self, k: int):
+        """
+        handle the keyboard input event.
+
+        **Builtin shortcut**
+
+        * '<escape>' clear input buffer
+        * '<backspace>' delete last one character in buffer
+        * '<space>' playing or pausing the video if the buffer is empty
+        * '<left>', '<right>' back/forward 5 second
+        * '+', '-' change the video playing speed
+        * '<enter>' invoke command in buffer.
+
+        Parameters
+        ----------
+        k
+            ascii code.
+
+        """
         if k == 27:  # escape:
             self.buffer = ''
         elif k == 8:  # backspace
@@ -615,6 +958,16 @@ class Main:
             self.buffer += chr(k)
 
     def handle_command(self, command: str):
+        """
+        invoke command.
+
+        press 'h' to print help on the UI.
+
+        Parameters
+        ----------
+        command
+
+        """
         LOGGER.debug(f'command : {command}')
         if command == 'h':
             self.enqueue_message('h : print key shortcut help')
@@ -937,8 +1290,23 @@ class Main:
             self.enqueue_message(f'unknown command : {command}')
 
     def handle_mouse_event(self, event: int, x: int, y: int, flag: int, data):
-        if event == cv2.EVENT_MOUSEMOVE:
-            if self._current_operation_state == self.MOUSE_STATE_MASKING:
+        """
+        handle mouse evemt.
+
+        Parameters
+        ----------
+        event
+            opencv mouse event type.
+        x
+            mouse x position
+        y
+            mouse y position.
+        flag
+        data
+
+        """
+        if event == cv2.EVENT_MOUSEMOVE:  # moving or dragging
+            if self._current_operation_state == self.MOUSE_STATE_ROI:
                 x0, y0, _, _ = self._current_roi_region
                 self._current_roi_region = [x0, y0, x, y]
             else:
@@ -947,20 +1315,20 @@ class Main:
                 else:
                     self._current_mouse_hover_frame = None
 
-        elif event == cv2.EVENT_LBUTTONUP:
+        elif event == cv2.EVENT_LBUTTONUP:  # MLB up
             if self._current_operation_state == self.MOUSE_STATE_FREE:
                 if self._current_mouse_hover_frame is not None:
                     self.current_frame = self._current_mouse_hover_frame
                 else:
                     self.is_playing = not self.is_playing
 
-        elif event == cv2.EVENT_RBUTTONDOWN:
-            self._current_operation_state = self.MOUSE_STATE_MASKING
+        elif event == cv2.EVENT_RBUTTONDOWN:  # MRB down
+            self._current_operation_state = self.MOUSE_STATE_ROI
             self._current_roi_region = [x, y, x, y]
             self.is_playing = False
 
-        elif event == cv2.EVENT_RBUTTONUP:
-            if self._current_operation_state == self.MOUSE_STATE_MASKING:
+        elif event == cv2.EVENT_RBUTTONUP:  # MRB up
+            if self._current_operation_state == self.MOUSE_STATE_ROI:
                 t = self.current_frame
                 n = self.roi_count
                 self.add_roi(*self._current_roi_region)
@@ -1007,6 +1375,10 @@ if __name__ == '__main__':
                     action='store_true',
                     help='pause when start',
                     dest='pause_on_start')
+    ap.add_argument('-e', '--stop-evaluation',
+                    action='store_true',
+                    help='stop evaluation when start',
+                    dest='stop_evaluation')
     ap.add_argument('FILE')
     opt = ap.parse_args()
 
@@ -1018,4 +1390,7 @@ if __name__ == '__main__':
     if opt.execute:
         main.start_no_gui()
     else:
+        if opt.stop_evaluation:
+            main.eval_lick = False
+
         main.start(pause_on_start=opt.pause_on_start)
