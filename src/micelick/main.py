@@ -345,7 +345,7 @@ class Main:
             loaded roi.
 
         """
-        LOGGER.debug(f'load roi = {file}')
+        LOGGER.debug(f'load roi {file}')
         ret: np.ndarray = np.load(file)
 
         # shape: (N, (time, x, y, width, height))
@@ -366,8 +366,8 @@ class Main:
 
         """
         np.save(file, self.roi)
-        self.enqueue_message(f'save roi = {file}')
-        LOGGER.debug(f'save roi = {file}')
+        self.enqueue_message(f'save roi {file}')
+        LOGGER.debug(f'save roi {file}')
 
     def eval_all_result(self):
         """
@@ -403,18 +403,15 @@ class Main:
                 self.enqueue_message('eval done')
             self.current_frame = frame
 
-        self._eval_task = threading.Thread(
-            name='eval thread',
-            target=self._eval_result,
-            kwargs=dict(
-                progress=self.enqueue_message,
-                before=before_task,
-                after=after_task
-            )
+        self._eval_result(
+            'eval thread',
+            progress=self.enqueue_message,
+            before=before_task,
+            after=after_task
         )
-        self._eval_task.start()
 
     def _eval_result(self,
+                     task_name: str,
                      frame_range: Tuple[int, int] = None,
                      progress: Callable[[str], None] = print,
                      before: Callable[[], None] = None,
@@ -442,14 +439,12 @@ class Main:
             callback after job finished.
 
         """
+        if self._eval_task is not None:
+            raise RuntimeError()
+
         vc = self.video_capture
         if vc is None:
             raise RuntimeError()
-
-        self._is_playing = False
-        self.eval_lick = False
-        self._eval_task_interrupt_flag = False
-        interrupt_flag = False
 
         ric = self.roi_count
         if ric == 0:
@@ -457,6 +452,8 @@ class Main:
 
         roi = self.roi
         rii = -1
+
+        frame = 0
 
         def get_roi():
             nonlocal rii
@@ -472,54 +469,66 @@ class Main:
 
         if frame_range is None:
             frame_range = (0, self.video_total_frames)
-            self.current_frame = 0
-        else:
-            self.current_frame = frame_range[0]
+
+        self._eval_task_interrupt_flag = False
+        self._is_playing = False
+        self.eval_lick = False
 
         total_eval_frame = frame_range[1] - frame_range[0]
         lick_possibility = self.lick_possibility
-        value_write = False
 
-        if before is not None:
-            before()
+        def task():
+            nonlocal frame
 
-        step = 10
-        progress(f'eval 0% ...')
-        for i in range(total_eval_frame):
-            if self._eval_task_interrupt_flag:
-                interrupt_flag = True
-                break
+            interrupt_flag = False
+            self.current_frame = frame_range[0]
+            value_write = False
 
-            frame = frame_range[0] + i
-            if 100 * i / total_eval_frame > step:
-                progress(f'eval {step}% ...')
-                step += 10
+            if before is not None:
+                before()
 
-            ret, image = vc.read()
-            self.current_image = image
-
-            if not skip_non_zero or lick_possibility[frame] == 0:
-                _roi = get_roi()
-                if _roi is not None:
-                    self.current_value = value = self.calculate_value(image, _roi)
-                else:
-                    value = 0
-
-                lick_possibility[frame] = value
-                value_write = True
-            else:
-                self.current_value = value = lick_possibility[frame]
-
-            if value_update is not None:
-                if not value_update(frame, value):
+            step = 10
+            progress(f'eval 0% ...')
+            for i in range(total_eval_frame):
+                if self._eval_task_interrupt_flag:
+                    interrupt_flag = True
                     break
-        else:
-            progress(f'eval 100%')
 
-        self._eval_task = None
-        self._output_file_saved = self._output_file_saved and not value_write
-        if after is not None:
-            after(interrupt_flag)
+                frame = frame_range[0] + i
+                if 100 * i / total_eval_frame > step:
+                    progress(f'eval {step}% ...')
+                    step += 10
+
+                ret, image = vc.read()
+                self.current_image = image
+
+                if not skip_non_zero or lick_possibility[frame] == 0:
+                    _roi = get_roi()
+                    if _roi is not None:
+                        value = self.calculate_value(image, _roi)
+                    else:
+                        value = 0
+
+                    lick_possibility[frame] = value
+                    value_write = True
+                else:
+                    value = lick_possibility[frame]
+
+                self.current_value = value
+
+                if value_update is not None:
+                    if not value_update(frame, value):
+                        break
+            else:
+                progress(f'eval 100%')
+
+            self._eval_task = None
+            self._output_file_saved = self._output_file_saved and not value_write
+            if after is not None:
+                after(interrupt_flag)
+
+        self._eval_task = threading.Thread(name=task_name, target=task)
+        self._eval_task.start()
 
     def clear_result(self):
         """clear licking possibility"""
@@ -598,8 +607,8 @@ class Main:
                 np.save(file, disk_data)
 
         self._output_file_saved = True
-        self.enqueue_message(f'save result = {file}')
-        LOGGER.debug(f'save result = {file}')
+        self.enqueue_message(f'save result {file}')
+        LOGGER.debug(f'save result {file}')
 
     def load_result(self, file: str):
         """
@@ -1055,8 +1064,8 @@ class Main:
             except KeyboardInterrupt:
                 raise
             except BaseException as e:
-                LOGGER.warning(f'command "{command}" : {e}', exc_info=True)
-                self.enqueue_message(str(e))
+                LOGGER.warning(f'command "{command}"', exc_info=True)
+                self.enqueue_message(f'command "{command}" {type(e).__name__}: {e}')
         elif 32 <= k < 127:  # printable
             self.buffer += chr(k)
         else:
@@ -1606,20 +1615,15 @@ class Main:
                 LOGGER.debug(f'jump to {self.current_frame}, lick possibility {self.current_value}')
             self.is_playing = old_playing
 
-        self._eval_task = threading.Thread(
-            name='jump to next lick',
-            target=self._eval_result,
-            kwargs=dict(
-                frame_range=(frame, self.video_total_frames),
-                value_update=_stop,
-                before=_before,
-                after=_after,
-                progress=(lambda it: None),
-                skip_non_zero=True
-            )
+        self._eval_result(
+            'jump to next lick',
+            frame_range=(frame, self.video_total_frames),
+            value_update=_stop,
+            before=_before,
+            after=_after,
+            progress=(lambda it: None),
+            skip_non_zero=True
         )
-
-        self._eval_task.start()
 
 
 if __name__ == '__main__':
