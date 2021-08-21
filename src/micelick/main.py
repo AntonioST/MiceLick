@@ -32,7 +32,7 @@ def rectangle_to_mask(w: int, h: int, roi: np.ndarray) -> np.ndarray:
     h
         view height
     roi
-        region of interest with shape (fame, x0, y0, x1, y1)
+        region of interest with shape (frame, x0, y0, x1, y1)
 
     Returns
     -------
@@ -79,10 +79,11 @@ class Main:
         # lick properties
         self.current_value = 0  # = lick_possibility[current_frame], updated on each frame.
         self.lick_possibility: np.ndarray = None  # shape (total_frames,)
+        self.lick_threshold = 50
 
         # display properties
         self.window_title = 'MouseLicking'  # window title.
-        self.roi: np.ndarray = np.zeros((0, 5), dtype=int)  # [fame, x0, y0, x1, y1]
+        self.roi: np.ndarray = np.zeros((0, 5), dtype=int)  # [frame, x0, y0, x1, y1]
         self.show_time = True  # show time bar
         self.show_lick = True  # show lick possibility curve
         self.show_lick_duration = 30  # duration of lick possibility curve
@@ -127,7 +128,7 @@ class Main:
         value
             playing speed factor. value range from (0.25, 32).
         """
-        value = min(32.0, max(0.25, value))
+        value = min(32, max(0.25, value))
         self._speed_factor = value
         self._sleep_interval = 1 / self.video_fps / value
         self.enqueue_message(f'speed x{value}')
@@ -464,6 +465,19 @@ class Main:
         self.lick_possibility[:] = 0
         self._output_file_saved = False
 
+    def count_result(self, f0, f1=None) -> int:
+        if f1 is None:
+            f1 = self.current_frame
+            f0 = max(0, f1 - f0)
+        else:
+            if f0 < 0 or f1 < 0:
+                raise ValueError()
+
+        possibility = self.lick_possibility[f0:f1]
+        lick_p = possibility >= self.lick_threshold
+        lick_t = np.diff(lick_p)
+        return np.count_nonzero(lick_t > 0)
+
     def save_result(self, file: str, save_all=False):
         """
         save licking possibility into file.
@@ -769,32 +783,35 @@ class Main:
         h = self.video_height
         frame = self.current_frame
         y0 = h - 30
-        length = w - 2 * s
 
         # duration
-        duration = (self.show_lick_duration * self.video_fps) // 2
+        duration = (self.show_lick_duration * self.video_fps)
         f0 = max(0, frame - duration)
-        cv2.putText(image, f'-{self.show_lick_duration} s', (10, y0),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
 
         # possibility curve
         if f0 != frame:
-            # FIXME not work properly
-            v = self.lick_possibility[f0:frame]
-            length = min(length, len(v))
-            y = np.histogram(v, bins=length)[0]
-            y = y / max(1, np.max(y))
-            y = y0 - 20 * y.astype(np.int32)
-            x = np.linspace(s, w - s, length, dtype=np.int32)
+            v = self.lick_possibility[f0:frame] >= self.lick_threshold
+            c = np.count_nonzero(np.diff(v) > 0)
+            x = np.linspace(s, w - s, duration, dtype=np.int32)
+            if len(v) == duration:
+                y = y0 - 20 * v
+            else:
+                y = np.full((duration,), y0)
+                y[-len(v):] = y0 - 20 * v
+
             p = np.vstack((x, y)).transpose()
             cv2.polylines(image, [p], 0, COLOR_RED, 2, cv2.LINE_AA)
         else:
+            c = 0
             cv2.line(image, (s, y0), (w - s, y0), COLOR_RED, 1, cv2.LINE_AA)
+
+        cv2.putText(image, f'{c:2d}, -{self.show_lick_duration}s', (10, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_RED, 2, cv2.LINE_AA)
 
         # lick possibility value
         if self.current_value is not None:
-            cv2.putText(image, f'{self.current_value:01.2f}', (w - 100, y0),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, COLOR_RED, 2, cv2.LINE_AA)
+            cv2.putText(image, f'p={self.current_value:01.2f}', (w - 100, y0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_RED, 2, cv2.LINE_AA)
 
     def _show_time_bar(self, image):
         """drawing time bar"""
@@ -979,6 +996,7 @@ class Main:
             self.enqueue_message('j : jump to ...')
             self.enqueue_message('d : display ...')
             self.enqueue_message('r : roi ...')
+            self.enqueue_message('l : lick ....')
             self.enqueue_message('o : result ...')
 
         elif command == 'q':
@@ -1003,7 +1021,6 @@ class Main:
             raise KeyboardInterrupt
 
         elif command == 'o':
-            self.enqueue_message('count [sec]  : lick count within sec')
             self.enqueue_message('eval[+-?]    : en/disable licking calculation')
             self.enqueue_message('eval-all     : eval all licking possibility and disable calculation')
             self.enqueue_message('clear        : clear result')
@@ -1011,18 +1028,6 @@ class Main:
             self.enqueue_message('load <file>  : load result')
             self.enqueue_message('load?        : print result output file')
             self.enqueue_message('save?        : print result output file')
-
-        elif command.startswith('count'):
-            part: List[str] = list(filter(len, command.split(' ')))
-            if len(part) == 1:
-                t_sec = 10
-            elif len(part) == 2:
-                t_sec = int(part[1])
-            else:
-                raise ValueError()
-
-            # TODO
-            self.enqueue_message('not implemented')
 
         elif command == 'eval-all':
             self.eval_all_result()
@@ -1110,6 +1115,7 @@ class Main:
             self.enqueue_message('j<sec>        : jump to <sec> time')
             self.enqueue_message('j<min>:<sec>  : jump to <min>:<sec> time')
             self.enqueue_message('j[-+][<min>:]<sec> : jump to back/forward time')
+            self.enqueue_message('jf<index>     : jump to frame')
             self.enqueue_message('jend          : jump to END')
             self.enqueue_message('jr            : jump to current roi time')
             self.enqueue_message('jr<idx>       : jump to <idx> roi time')
@@ -1124,6 +1130,13 @@ class Main:
         elif command.startswith('jr'):
             self.handle_command(f'r{int(command[2:])}j')
 
+        elif command.startswith('jf'):
+            frame = int(command[2:])
+            self.current_frame = frame
+            t_sec = frame // self.video_fps
+            t_min, t_sec = t_sec // 60, t_sec % 60
+            LOGGER.debug(f'jump to {t_min:02d}:{t_sec:02d}')
+
         elif command.startswith('j'):
             if command.startswith('j+'):
                 relative = 1
@@ -1135,16 +1148,17 @@ class Main:
                 relative = 0
                 command = command[1:]
 
-            t_min, t_sec = _decode_buffer_as_time(command)
-            frame = (t_min * 60 + t_sec) * self.video_fps
+            t_min, t_sec, t_frame = self._decode_buffer_as_time(command)
+            frame = (t_min * 60 + t_sec) * self.video_fps + t_frame
             if relative == 0:
                 self.current_frame = frame
             else:
                 frame = self.current_frame + relative * frame
                 self.current_frame = frame
-                t_min, t_sec = frame // 60, frame % 60
+                t_sec = frame // self.video_fps
+                t_min, t_sec = t_sec // 60, t_sec % 60
 
-            LOGGER.debug(f'jump to {t_min:02d}:{t_sec:02d} (frame={frame})')
+            LOGGER.debug(f'jump to {t_min:02d}:{t_sec:02d}')
 
         elif command == 'd':
             self.enqueue_message('dtime[+-?] : display time line')
@@ -1192,6 +1206,53 @@ class Main:
                 raise ValueError(command)
 
             self.enqueue_message('show roi : ' + ('on' if self.show_roi else 'off'))
+
+        elif command == 'l':
+            self.enqueue_message('lc [<sec>]    : lick count back to <sec>')
+            self.enqueue_message('lc <t1> <t2>  : lick count between <t1> and <t2>')
+            self.enqueue_message('lth [value]   : lick threshold')
+            self.enqueue_message('ldt [value]   : lick curve duration')
+
+        elif command == 'lc':
+            part: List[str] = list(filter(len, command.split(' ')))
+            if len(part) == 1:
+                f1 = self.show_lick_duration * self.video_fps
+                f2 = None
+            elif len(part) == 2:
+                f1 = int(part[1]) * self.video_fps
+                f2 = None
+            elif len(part) == 3:
+                f1 = self._decode_buffer_as_frame(part[1])
+                f2 = self._decode_buffer_as_frame(part[2])
+            else:
+                raise ValueError()
+
+            count = self.count_result(f1, f2)
+            self.enqueue_message(f'count {count}')
+
+        elif command.startswith('lth'):
+            part: List[str] = list(filter(len, command.split(' ')))
+            if len(part) == 1:
+                self.enqueue_message(f'threshold {self.lick_threshold}')
+            elif len(part) == 2:
+                value = int(part[1])
+                if value < 0:
+                    raise ValueError(f'illegal threshold value : {value}')
+                self.lick_threshold = value
+            else:
+                raise ValueError(command)
+
+        elif command.startswith('ldt'):
+            part: List[str] = list(filter(len, command.split(' ')))
+            if len(part) == 1:
+                self.enqueue_message(f'duration {self.show_lick_duration}')
+            elif len(part) == 2:
+                value = int(part[1])
+                if value <= 0:
+                    raise ValueError(f'illegal duration value : {value}')
+                self.show_lick_duration = value
+            else:
+                raise ValueError(command)
 
         elif command == 'r':
             self.enqueue_message('rp            : print current roi information')
@@ -1292,6 +1353,44 @@ class Main:
             # self.enqueue_message('q             : quit program')
             self.enqueue_message(f'unknown command : {command}')
 
+    def _decode_buffer_as_time(self, buffer: str) -> Tuple[int, int, int]:
+        if buffer == 'end':
+            t_sec = self.video_total_frames // self.video_fps
+            t_frame = self.video_total_frames % self.video_fps
+            return t_sec // 60, t_sec % 60, t_frame
+
+        if '.' in buffer:
+            buffer, t_frame = buffer.split('.')
+            t_frame = int(t_frame)
+        else:
+            t_frame = 0
+
+        if ':' in buffer:
+            t_min, t_sec = buffer.split(':')
+            return int(t_min), int(t_sec), t_frame
+        else:
+            t_sec = int(buffer)
+            return t_sec // 60, t_sec % 60, t_frame
+
+    def _decode_buffer_as_frame(self, buffer: str) -> int:
+        if buffer == 'end':
+            return self.video_total_frames
+
+        if '.' in buffer:
+            buffer, t_frame = buffer.split('.')
+            t_frame = int(t_frame)
+        else:
+            t_frame = 0
+
+        if ':' in buffer:
+            t_min, t_sec = buffer.split(':')
+            t_sec = int(t_min) * 60 + int(t_sec)
+            return t_sec * self.video_fps + t_frame
+
+        else:
+            t_sec = int(buffer)
+            return t_sec * self.video_fps + t_frame
+
     def handle_mouse_event(self, event: int, x: int, y: int, flag: int, data):
         """
         handle mouse evemt.
@@ -1342,13 +1441,7 @@ class Main:
                 self._current_operation_state = self.MOUSE_STATE_FREE
 
 
-def _decode_buffer_as_time(buffer: str) -> Tuple[int, int]:
-    if ':' in buffer:
-        t_min, t_sec = buffer.split(':')
-        return int(t_min), int(t_sec)
-    else:
-        t_sec = int(buffer)
-        return t_sec // 60, t_sec % 60
+
 
 
 if __name__ == '__main__':
@@ -1374,6 +1467,12 @@ if __name__ == '__main__':
                     default=None,
                     help='save licking result',
                     dest='output')
+    ap.add_argument('-T', '--th', '--threshold',
+                    metavar='VALUE',
+                    type=int,
+                    default=None,
+                    help='lick threshold',
+                    dest='lick_threshold')
     ap.add_argument('-p', '--pause-on-start',
                     action='store_true',
                     help='pause when start',
@@ -1389,6 +1488,9 @@ if __name__ == '__main__':
     main.output_file = opt.output
     main.roi_use_file = opt.use_roi
     main.roi_output_file = opt.save_roi if opt.save_roi is not None else opt.use_roi
+
+    if opt.lick_threshold is not None:
+        main.lick_threshold = opt.lick_threshold
 
     if opt.execute:
         main.start_no_gui()
