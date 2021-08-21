@@ -110,7 +110,8 @@ class Main:
         self._current_roi_region: Optional[List[int]] = None  # roi when roi making
         self._message_queue: List[Tuple[float, str]] = []  # message queue
         self._mask_cache: Optional[Tuple[int, np.ndarray, np.ndarray]] = None  # mask cache.
-        self._eval_task = None  # evaluation thread.
+        self._eval_task: threading.Thread = None  # evaluation thread.
+        self._eval_task_interrupt_flag = False
         self.buffer = ''  # input buffer
 
     @property
@@ -178,7 +179,7 @@ class Main:
         if not (0 <= value < self.video_total_frames):
             raise ValueError()
 
-        vc.set(cv2.CAP_PROP_POS_FRAMES, value)
+        vc.set(cv2.CAP_PROP_POS_FRAMES, value - 1)
         self.current_image = None
 
     @property
@@ -256,7 +257,7 @@ class Main:
                 ret = mask
         return ret
 
-    def add_roi(self, x0: int, y0: int, x1: int, y1: int, t: int = None):
+    def add_roi(self, x0: int, y0: int, x1: int, y1: int, t: int = None) -> int:
         """
         add roi.
 
@@ -271,16 +272,30 @@ class Main:
         t
             frame number. If None, use current frame number.
 
+        Returns
+        -------
+        index
+            roi index
+
         """
         if t is None:
             t = self.current_frame
 
-        i = np.nonzero(self.roi[:, 0] == t)[0]
-        if len(i) == 0:
+        i = self._index_roi(t)
+        if i is None:
             self.roi = np.sort(np.append(self.roi, [(t, x0, y0, x1, y1)], axis=0), axis=0)
         else:
-            self.roi[i[0]] = (t, x0, y0, x1, y1)
+            self.roi[i] = (t, x0, y0, x1, y1)
         LOGGER.info(f'add roi [{t},{x0},{y0},{x1},{y1}]')
+
+        return self._index_roi(t)
+
+    def _index_roi(self, frame: int) -> Optional[int]:
+        i = np.nonzero(self.roi[:, 0] == frame)[0]
+        if len(i) == 0:
+            return None
+        else:
+            return i[0]
 
     def del_roi(self, index: int):
         """
@@ -293,8 +308,23 @@ class Main:
 
         """
         t, x0, y0, x1, y1 = self.roi[index]
+        if index == 0:
+            t0 = 0
+        else:
+            t0 = self.roi[index - 1][0]
+
+        if index == self.roi_count:
+            t1 = self.video_total_frames
+        else:
+            t1 = self.roi[index + 1][0]
+
         self.roi = np.delete(self.roi, index, axis=0)
         LOGGER.info(f'del roi [{t},{x0},{y0},{x1},{y1}]')
+
+        # clear result
+        self.lick_possibility[t0:t1] = 0
+        LOGGER.debug(f'clear result from {t0} to {t1}')
+        self._output_file_saved = False
 
     def clear_roi(self):
         """clear all roi"""
@@ -356,8 +386,7 @@ class Main:
         if self.output_file is None:
             raise RuntimeError('output file not set')
 
-        ric = self.roi.shape[0]
-        if ric == 0:
+        if self.roi_count == 0:
             raise RuntimeError('empty ROI')
         if self.roi_output_file is not None:
             self.save_roi(self.roi_output_file)
@@ -367,25 +396,31 @@ class Main:
         def before_task():
             self.enqueue_message('start eval')
 
-        def after_task():
-            self.enqueue_message('eval done')
+        def after_task(interrupted: bool):
+            if interrupted:
+                self.enqueue_message('eval interrupted')
+            else:
+                self.enqueue_message('eval done')
             self.current_frame = frame
 
         self._eval_task = threading.Thread(
             name='eval thread',
-            target=self._eval_all_result,
-            args=(self.enqueue_message,),
+            target=self._eval_result,
             kwargs=dict(
+                progress=self.enqueue_message,
                 before=before_task,
                 after=after_task
             )
         )
         self._eval_task.start()
 
-    def _eval_all_result(self,
-                         progress: Callable[[str], None] = print,
-                         before: Callable[[], None] = None,
-                         after: Callable[[], None] = None):
+    def _eval_result(self,
+                     frame_range: Tuple[int, int] = None,
+                     progress: Callable[[str], None] = print,
+                     before: Callable[[], None] = None,
+                     after: Callable[[bool], None] = None,
+                     value_update: Callable[[int, float], bool] = None,
+                     skip_non_zero=False):
         """
         evaluation job.
 
@@ -407,20 +442,20 @@ class Main:
             callback after job finished.
 
         """
-        if before is not None:
-            before()
-
         vc = self.video_capture
-        assert vc is not None
+        if vc is None:
+            raise RuntimeError()
 
         self._is_playing = False
         self.eval_lick = False
-        self.current_frame = 0
+        self._eval_task_interrupt_flag = False
+        interrupt_flag = False
+
+        ric = self.roi_count
+        if ric == 0:
+            raise RuntimeError('empty roi')
 
         roi = self.roi
-        ric = roi.shape[0]
-        assert ric != 0
-
         rii = -1
 
         def get_roi():
@@ -435,30 +470,56 @@ class Main:
                 return None
             return roi[rii]
 
+        if frame_range is None:
+            frame_range = (0, self.video_total_frames)
+            self.current_frame = 0
+        else:
+            self.current_frame = frame_range[0]
+
+        total_eval_frame = frame_range[1] - frame_range[0]
         lick_possibility = self.lick_possibility
+        value_write = False
+
+        if before is not None:
+            before()
 
         step = 10
         progress(f'eval 0% ...')
-        for frame in range(self.video_total_frames):
-            if 100 * frame / self.video_total_frames > step:
+        for i in range(total_eval_frame):
+            if self._eval_task_interrupt_flag:
+                interrupt_flag = True
+                break
+
+            frame = frame_range[0] + i
+            if 100 * i / total_eval_frame > step:
                 progress(f'eval {step}% ...')
                 step += 10
 
             ret, image = vc.read()
             self.current_image = image
-            _roi = get_roi()
-            if _roi is not None:
-                self.current_value = value = self.calculate_value(image, _roi)
+
+            if not skip_non_zero or lick_possibility[frame] == 0:
+                _roi = get_roi()
+                if _roi is not None:
+                    self.current_value = value = self.calculate_value(image, _roi)
+                else:
+                    value = 0
+
+                lick_possibility[frame] = value
+                value_write = True
             else:
-                value = 0
+                self.current_value = value = lick_possibility[frame]
 
-            lick_possibility[frame] = value
+            if value_update is not None:
+                if not value_update(frame, value):
+                    break
+        else:
+            progress(f'eval 100%')
 
-        progress(f'eval 100%')
         self._eval_task = None
-        self._output_file_saved = False
+        self._output_file_saved = self._output_file_saved and not value_write
         if after is not None:
-            after()
+            after(interrupt_flag)
 
     def clear_result(self):
         """clear licking possibility"""
@@ -477,6 +538,16 @@ class Main:
         lick_p = possibility >= self.lick_threshold
         lick_t = np.diff(lick_p)
         return np.count_nonzero(lick_t > 0)
+
+    def baseline_result(self, f0=None, f1=None):
+        if f0 is None:
+            f0 = 0
+
+        if f1 is None:
+            f1 = self.video_total_frames
+
+        possibility = self.lick_possibility[f0:f1]
+        return np.mean(possibility, where=np.logical_and(possibility > 0, possibility < self.lick_threshold))
 
     def save_result(self, file: str, save_all=False):
         """
@@ -644,7 +715,7 @@ class Main:
         vc = self._init_video()
 
         try:
-            self._eval_all_result(LOGGER.debug)
+            self._eval_result(progress=LOGGER.debug)
             self.save_result(self.output_file)
         except KeyboardInterrupt:
             pass
@@ -939,9 +1010,14 @@ class Main:
         * '<escape>' clear input buffer
         * '<backspace>' delete last one character in buffer
         * '<space>' playing or pausing the video if the buffer is empty
-        * '<left>', '<right>' back/forward 5 second
+        * '<left>' (','), '<right>' ('.') back/forward 5 second
+        * '[', ']' back/forward 1 frame
         * '+', '-' change the video playing speed
         * '<enter>' invoke command in buffer.
+
+        **Known bugs**
+
+        1. when you click the window, left and right key are not able to be detected anymore.
 
         Parameters
         ----------
@@ -949,20 +1025,27 @@ class Main:
             ascii code.
 
         """
+        empty_buffer = len(self.buffer) == 0
         if k == 27:  # escape:
             self.buffer = ''
         elif k == 8:  # backspace
             if len(self.buffer) > 0:
                 self.buffer = self.buffer[:-1]
-        elif len(self.buffer) == 0 and k == 32:  # space
+        elif empty_buffer and k == 32:  # space
             self.is_playing = not self.is_playing
-        elif k == 81:  # left
+        elif k == 91:  # [
+            self.current_frame = max(0, self.current_frame - 1)
+        elif k == 93:  # ]
+            self.current_frame = min(self.video_total_frames - 1, self.current_frame + 1)
+        elif k == 81 or (empty_buffer and k == 44):  # left ,
             self.current_frame = max(0, self.current_frame - 5 * self.video_fps)
-        elif k == 83:  # right
+            # LOGGER.debug('-5 sec')
+        elif k == 83 or (empty_buffer and k == 46):  # right .
             self.current_frame = min(self.video_total_frames - 1, self.current_frame + 5 * self.video_fps)
-        elif len(self.buffer) == 0 and k == ord('+'):
+            # LOGGER.debug('+5 sec')
+        elif empty_buffer and k == ord('+'):
             self.speed_factor *= 2
-        elif len(self.buffer) == 0 and k == ord('-'):
+        elif empty_buffer and k == ord('-'):
             self.speed_factor /= 2
         elif k == 13:  # enter:
             command = self.buffer
@@ -976,6 +1059,8 @@ class Main:
                 self.enqueue_message(str(e))
         elif 32 <= k < 127:  # printable
             self.buffer += chr(k)
+        else:
+            print(k)
 
     def handle_command(self, command: str):
         """
@@ -1001,14 +1086,14 @@ class Main:
 
         elif command == 'q':
             if self._output_file_saved or self.output_file is None:
-                raise KeyboardInterrupt
+                self._quit()
 
             self.enqueue_message('result not saved.')
             self.enqueue_message('qq : force quit')
             self.enqueue_message('wq : save and quit')
 
         elif command == 'qq':
-            raise KeyboardInterrupt
+            self._quit()
 
         elif command == 'wq':
             if not self._output_file_saved:
@@ -1018,11 +1103,12 @@ class Main:
                     self.enqueue_message('None output_file, abort quiting')
                     return
 
-            raise KeyboardInterrupt
+            self._quit()
 
         elif command == 'o':
             self.enqueue_message('eval[+-?]    : en/disable licking calculation')
             self.enqueue_message('eval-all     : eval all licking possibility and disable calculation')
+            self.enqueue_message('eval-stop    : stop eval task')
             self.enqueue_message('clear        : clear result')
             self.enqueue_message('save <file>  : save result')
             self.enqueue_message('load <file>  : load result')
@@ -1031,6 +1117,9 @@ class Main:
 
         elif command == 'eval-all':
             self.eval_all_result()
+
+        elif command == 'eval-stop':
+            self._eval_task_interrupt_flag = True
 
         elif command.startswith('eval'):
             if command == 'eval':
@@ -1115,10 +1204,11 @@ class Main:
             self.enqueue_message('j<sec>        : jump to <sec> time')
             self.enqueue_message('j<min>:<sec>  : jump to <min>:<sec> time')
             self.enqueue_message('j[-+][<min>:]<sec> : jump to back/forward time')
-            self.enqueue_message('jf<index>     : jump to frame')
+            self.enqueue_message('jf[-+]<index> : jump to frame')
             self.enqueue_message('jend          : jump to END')
             self.enqueue_message('jr            : jump to current roi time')
             self.enqueue_message('jr<idx>       : jump to <idx> roi time')
+            self.enqueue_message('jl            : jump to next lick frame')
 
         elif command == 'jend':
             self.current_frame = self.video_total_frames - 1
@@ -1131,11 +1221,27 @@ class Main:
             self.handle_command(f'r{int(command[2:])}j')
 
         elif command.startswith('jf'):
-            frame = int(command[2:])
+            if command.startswith('jf+'):
+                relative = 1
+                command = command[3:]
+            elif command.startswith('jf-'):
+                relative = -1
+                command = command[3:]
+            else:
+                relative = 0
+                command = command[2:]
+
+            frame = int(command)
+            if relative != 0:
+                frame = self.current_frame + relative * frame
+
             self.current_frame = frame
             t_sec = frame // self.video_fps
             t_min, t_sec = t_sec // 60, t_sec % 60
             LOGGER.debug(f'jump to {t_min:02d}:{t_sec:02d}')
+
+        elif command == 'jl':
+            self._jump_next_lick_frame()
 
         elif command.startswith('j'):
             if command.startswith('j+'):
@@ -1150,13 +1256,12 @@ class Main:
 
             t_min, t_sec, t_frame = self._decode_buffer_as_time(command)
             frame = (t_min * 60 + t_sec) * self.video_fps + t_frame
-            if relative == 0:
-                self.current_frame = frame
-            else:
+            if relative != 0:
                 frame = self.current_frame + relative * frame
-                self.current_frame = frame
-                t_sec = frame // self.video_fps
-                t_min, t_sec = t_sec // 60, t_sec % 60
+
+            self.current_frame = frame
+            t_sec = frame // self.video_fps
+            t_min, t_sec = t_sec // 60, t_sec % 60
 
             LOGGER.debug(f'jump to {t_min:02d}:{t_sec:02d}')
 
@@ -1212,6 +1317,37 @@ class Main:
             self.enqueue_message('lc <t1> <t2>  : lick count between <t1> and <t2>')
             self.enqueue_message('lth [value]   : lick threshold')
             self.enqueue_message('ldt [value]   : lick curve duration')
+            self.enqueue_message('l[a|<idx>]b   : lick possibility baseline for <idx>/current/all roi')
+
+        elif command.startswith('l') and command.endswith('b'):
+            if self.roi_count == 0:
+                raise RuntimeError('empty roi')
+
+            if command == 'lab':
+                v = self.baseline_result()
+            else:
+                if command == 'lb':
+                    roi = self.current_roi
+                    if roi is None:
+                        idx = None
+                    else:
+                        idx = self._index_roi(roi[0])
+                else:
+                    idx = int(command[1:-1])
+                    if idx < 0:
+                        raise ValueError()
+
+                if idx is not None:
+                    f1 = self.roi[idx, 0]
+                    if idx + 1 < self.roi_count:
+                        f2 = self.roi[idx + 1, 0]
+                    else:
+                        f2 = None
+                    v = self.baseline_result(f1, f2)
+                else:
+                    v = 0
+
+            self.enqueue_message(f'baseline {v}')
 
         elif command == 'lc':
             part: List[str] = list(filter(len, command.split(' ')))
@@ -1316,7 +1452,8 @@ class Main:
             t = int(part[5]) if len(part) == 6 else self.current_frame
             if len(part) > 6:
                 raise ValueError(command)
-            self.add_roi(x0, y0, x1, y1, t)
+            n = self.add_roi(x0, y0, x1, y1, t)
+            self.enqueue_message(f'add roi[{n}] at ' + self._frame_to_text(t))
 
         elif command == 'rsave?':
             self.enqueue_message(str(self.roi_output_file))
@@ -1432,16 +1569,57 @@ class Main:
         elif event == cv2.EVENT_RBUTTONUP:  # MRB up
             if self._current_operation_state == self.MOUSE_STATE_ROI:
                 t = self.current_frame
-                n = self.roi_count
-                self.add_roi(*self._current_roi_region)
+                n = self.add_roi(*self._current_roi_region)
                 self.enqueue_message(f'add roi[{n}] at ' + self._frame_to_text(t))
                 self._current_roi_region = None
                 self._current_operation_state = self.MOUSE_STATE_FREE
             else:
                 self._current_operation_state = self.MOUSE_STATE_FREE
 
+    def _quit(self):
+        task = self._eval_task
+        if task is not None:
+            self._eval_task_interrupt_flag = True
+            task.join()
 
+        raise KeyboardInterrupt
 
+    def _jump_next_lick_frame(self, next_n_frame=1):
+        if self._eval_task is not None:
+            self.enqueue_message('cannot jump during evaluation task')
+            return
+
+        old_playing = self.is_playing
+        frame = self.current_frame + next_n_frame
+
+        def _stop(_frame, _value):
+            return _value < self.lick_threshold
+
+        def _before():
+            self.enqueue_message('start find next lick frame')
+
+        def _after(interrupted):
+            if interrupted:
+                self.enqueue_message('jump interrupted')
+            else:
+                self.enqueue_message('jump next lick frame')
+                LOGGER.debug(f'jump to {self.current_frame}, lick possibility {self.current_value}')
+            self.is_playing = old_playing
+
+        self._eval_task = threading.Thread(
+            name='jump to next lick',
+            target=self._eval_result,
+            kwargs=dict(
+                frame_range=(frame, self.video_total_frames),
+                value_update=_stop,
+                before=_before,
+                after=_after,
+                progress=(lambda it: None),
+                skip_non_zero=True
+            )
+        )
+
+        self._eval_task.start()
 
 
 if __name__ == '__main__':
