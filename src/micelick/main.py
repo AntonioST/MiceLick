@@ -355,10 +355,11 @@ class Main:
         if self.output_file is None:
             raise RuntimeError('output file not set')
 
-        roi = self.load_roi(self.roi_use_file)
-        ric = roi.shape[0]
+        ric = self.roi.shape[0]
         if ric == 0:
             raise RuntimeError('empty ROI')
+        if self.roi_output_file is not None:
+            self.save_roi(self.roi_output_file)
 
         frame = self.current_frame
 
@@ -446,9 +447,11 @@ class Main:
             self.current_image = image
             _roi = get_roi()
             if _roi is not None:
-                lick_possibility[frame] = self.calculate_value(image, _roi)
+                self.current_value = value = self.calculate_value(image, _roi)
             else:
-                lick_possibility[frame] = 0
+                value = 0
+
+            lick_possibility[frame] = value
 
         progress(f'eval 100%')
         self._eval_task = None
@@ -560,7 +563,7 @@ class Main:
         if self._mask_cache is None or self._mask_cache[0] != roi[0]:
             mask = rectangle_to_mask(self.video_width, self.video_height, roi)
             self._mask_cache = (roi[0], mask, mask[:, :, 0] == 255)
-        return self._mask_cache[1], self._mask_cache[1]
+        return self._mask_cache[1], self._mask_cache[2]
 
     def calculate_value(self, image, roi: np.ndarray) -> float:
         """
