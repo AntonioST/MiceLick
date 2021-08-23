@@ -32,7 +32,7 @@ def rectangle_to_mask(w: int, h: int, roi: np.ndarray) -> np.ndarray:
     h
         view height
     roi
-        region of interest with shape (frame, x0, y0, x1, y1)
+        region of interest with shape (frame, x0, y0, x1, y1, th)
 
     Returns
     -------
@@ -41,7 +41,7 @@ def rectangle_to_mask(w: int, h: int, roi: np.ndarray) -> np.ndarray:
 
     """
     ret = np.zeros((h, w, 3), dtype=np.uint8)
-    _, x0, y0, x1, y1 = roi
+    _, x0, y0, x1, y1, _ = roi
     cv2.rectangle(ret, (x0, y0), (x1, y1), COLOR_BLACK, -1, cv2.LINE_AA)
     return ret
 
@@ -83,7 +83,7 @@ class Main:
 
         # display properties
         self.window_title = 'MouseLicking'  # window title.
-        self.roi: np.ndarray = np.zeros((0, 5), dtype=int)  # [frame, x0, y0, x1, y1]
+        self.roi: np.ndarray = np.zeros((0, 6), dtype=int)  # [frame, x0, y0, x1, y1, th]
         self.show_time = True  # show time bar
         self.show_lick = True  # show lick possibility curve
         self.show_lick_duration = 30  # duration of lick possibility curve
@@ -223,6 +223,14 @@ class Main:
         self._message_queue.append((time.time(), text))
 
     @property
+    def current_threshold(self) -> int:
+        roi = self.current_roi
+        if roi is None:
+            return self.lick_threshold
+        else:
+            return roi[5]
+
+    @property
     def roi_count(self) -> int:
         """total roi number"""
         return self.roi.shape[0]
@@ -260,7 +268,7 @@ class Main:
                 ret = mask
         return ret
 
-    def add_roi(self, x0: int, y0: int, x1: int, y1: int, t: int = None) -> int:
+    def add_roi(self, x0: int, y0: int, x1: int, y1: int, t: int = None, th: int = None) -> int:
         """
         add roi.
 
@@ -274,6 +282,8 @@ class Main:
         y1
         t
             frame number. If None, use current frame number.
+        th
+            threshold value.
 
         Returns
         -------
@@ -284,12 +294,15 @@ class Main:
         if t is None:
             t = self.current_frame
 
+        if th is None:
+            th = self.lick_threshold
+
         i = self._index_roi(t)
         if i is None:
-            self.roi = np.sort(np.append(self.roi, [(t, x0, y0, x1, y1)], axis=0), axis=0)
+            self.roi = np.sort(np.append(self.roi, [(t, x0, y0, x1, y1, th)], axis=0), axis=0)
         else:
-            self.roi[i] = (t, x0, y0, x1, y1)
-        LOGGER.info(f'add roi [{t},{x0},{y0},{x1},{y1}]')
+            self.roi[i] = (t, x0, y0, x1, y1, th)
+        LOGGER.info(f'add roi [{t},{x0},{y0},{x1},{y1},{th}]')
 
         return self._index_roi(t)
 
@@ -313,7 +326,7 @@ class Main:
 
         """
 
-        t, x0, y0, x1, y1 = self.roi[index]
+        t, x0, y0, x1, y1, th = self.roi[index]
         if index == 0:
             t0 = 0
         else:
@@ -346,7 +359,7 @@ class Main:
             reset all lick possibility. If None, use opt_reset_result_when_del_roi.
 
         """
-        self.roi = np.zeros((0, 5), dtype=int)
+        self.roi = np.zeros((0, 6), dtype=int)
 
         if reset_result is None:
             reset_result = self.opt_reset_result_when_del_roi
@@ -373,7 +386,7 @@ class Main:
         ret: np.ndarray = np.load(file)
 
         # shape: (N, (time, x, y, width, height))
-        if not (ret.ndim == 2 and ret.shape[1] == 5):
+        if not (ret.ndim == 2 and ret.shape[1] == 6):
             raise RuntimeError('not a roi mask')
 
         self.roi = ret
@@ -559,6 +572,34 @@ class Main:
         self.lick_possibility[:] = 0
         self._output_file_saved = False
 
+    def _get_threshold(self, f0: int, f1: int) -> np.ndarray:
+        """
+        get threshold array from frame f0 to f1.
+
+        Parameters
+        ----------
+        f0
+        f1
+
+        Returns
+        -------
+
+        """
+        ret = np.full((f1 - f0,), self.lick_threshold)
+
+        ft = f1
+        fp = ft - 1
+        while fp > f0:
+            roi = self.get_roi(fp)
+            if roi is None:
+                break
+            fp = roi[0]
+            ret[(fp - f0):(ft - f0)] = roi[5]
+            ft = fp
+            fp = ft - 1
+
+        return ret
+
     def count_result(self, f0, f1=None) -> int:
         if f1 is None:
             f1 = self.current_frame
@@ -568,7 +609,8 @@ class Main:
                 raise ValueError()
 
         possibility = self.lick_possibility[f0:f1]
-        lick_p = possibility >= self.lick_threshold
+        threshold = self._get_threshold(f0, f1)
+        lick_p = possibility >= threshold
         lick_t = np.diff(lick_p)
         return np.count_nonzero(lick_t > 0)
 
@@ -580,7 +622,8 @@ class Main:
             f1 = self.video_total_frames
 
         possibility = self.lick_possibility[f0:f1]
-        return np.mean(possibility, where=np.logical_and(possibility > 0, possibility < self.lick_threshold))
+        threshold = self._get_threshold(f0, f1)
+        return np.mean(possibility, where=np.logical_and(possibility > 0, possibility < threshold))
 
     def save_result(self, file: str, save_all=False):
         """
@@ -872,7 +915,7 @@ class Main:
 
     def _show_roi(self, image, roi: np.ndarray):
         """drawing roi"""
-        _, x0, y0, x1, y1 = roi
+        _, x0, y0, x1, y1, _ = roi
         cv2.rectangle(image, (x0, y0), (x1, y1), COLOR_YELLOW, 2, cv2.LINE_AA)
 
     def _show_roi_tmp(self, image):
@@ -894,7 +937,7 @@ class Main:
 
         # possibility curve
         if f0 != frame:
-            v = self.lick_possibility[f0:frame] >= self.lick_threshold
+            v = self.lick_possibility[f0:frame] >= self._get_threshold(f0, frame)
             c = np.count_nonzero(np.diff(v) > 0)
             x = np.linspace(s, w - s, duration, dtype=np.int32)
             if len(v) == duration:
@@ -1427,9 +1470,10 @@ class Main:
             self.enqueue_message('rp            : print current roi information')
             self.enqueue_message('ra            : print all roi information')
             self.enqueue_message('r[<idx>]j     : jump to current/<idx> roi time')
+            self.enqueue_message('r+ x y x y [t] : add roi')
+            self.enqueue_message('rth [<value>] : set threshold for current roi')
             self.enqueue_message('r[<idx>]d     : delete current/<idx> roi')
             self.enqueue_message('rad           : delete all roi')
-            self.enqueue_message('r+ x y x y [t] : add roi')
             self.enqueue_message('rload <file>  : load roi')
             self.enqueue_message('rload?        : print use roi file')
             self.enqueue_message('rsave <file>  : save roi')
@@ -1438,7 +1482,9 @@ class Main:
         elif command == 'rp':
             roi = self.current_roi
             idx = np.nonzero(self.roi[:, 0] == roi[0])[0][0]
-            self.enqueue_message(f'roi[{idx}] t={roi[0]} ({roi[1]},{roi[2]}).({roi[3]},{roi[4]})')
+            self.enqueue_message(f'roi[{idx}] t={roi[0]}')
+            self.enqueue_message(f'r=({roi[1]},{roi[2]}).({roi[3]},{roi[4]})')
+            self.enqueue_message(f'th={roi[5]}')
 
         elif command == 'ra':
             cnt_roi = self.current_roi
@@ -1447,6 +1493,22 @@ class Main:
                     self.enqueue_message(f'*roi[{idx}] t={roi[0]} ({roi[1]},{roi[2]}).({roi[3]},{roi[4]})')
                 else:
                     self.enqueue_message(f' roi[{idx}] t={roi[0]} ({roi[1]},{roi[2]}).({roi[3]},{roi[4]})')
+
+        elif command.startswith('rth'):
+            part: List[str] = list(filter(len, command.split(' ')))
+            roi = self.current_roi
+            if roi is None:
+                self.enqueue_message('None roi')
+            elif len(part) == 1:
+                self.enqueue_message(f'threshold {roi[5]}')
+            elif len(part) == 2:
+                value = int(part[1])
+                if value < 0:
+                    raise ValueError(f'illegal threshold value : {value}')
+
+                roi[5] = value
+            else:
+                raise ValueError(command)
 
         elif command.startswith('r') and command.endswith('j'):
             if command == 'rj':
@@ -1482,10 +1544,11 @@ class Main:
             y0 = int(part[2])
             x1 = int(part[3])
             y1 = int(part[4])
-            t = int(part[5]) if len(part) == 6 else self.current_frame
-            if len(part) > 6:
+            t = int(part[5]) if len(part) >= 6 else self.current_frame
+            th = int(part[6]) if len(part) >= 7 else self.lick_threshold
+            if len(part) > 7:
                 raise ValueError(command)
-            n = self.add_roi(x0, y0, x1, y1, t)
+            n = self.add_roi(x0, y0, x1, y1, t, th)
             self.enqueue_message(f'add roi[{n}] at ' + self._frame_to_text(t))
 
         elif command == 'rsave?':
@@ -1626,7 +1689,7 @@ class Main:
         frame = self.current_frame + next_n_frame
 
         def _stop(_frame, _value):
-            return _value < self.lick_threshold
+            return _value < self.current_threshold
 
         def _before():
             self.enqueue_message('start find next lick frame')
