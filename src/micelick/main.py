@@ -93,13 +93,16 @@ class Main:
         self.mouse_stick_distance = 5  # diameter of region to stick mouse on roi frame on time bar
         self.message_fade_time = 5  # duration of the message start fading
 
-        # video property
+        # video properties
         self.video_capture: cv2.VideoCapture = None  # opencv object
         self.video_width: int = 0
         self.video_height: int = 0
         self.video_fps: int = 1
         self.video_total_frames: int = 0
         self.current_image = None  # current frame image from video_capture
+
+        # config properties
+        self.opt_reset_result_when_del_roi = True
 
         # control
         self._speed_factor: float = 1  # playing speed factor
@@ -110,7 +113,7 @@ class Main:
         self._current_roi_region: Optional[List[int]] = None  # roi when roi making
         self._message_queue: List[Tuple[float, str]] = []  # message queue
         self._mask_cache: Optional[Tuple[int, np.ndarray, np.ndarray]] = None  # mask cache.
-        self._eval_task: threading.Thread = None  # evaluation thread.
+        self._eval_task: Optional[threading.Thread] = None  # evaluation thread.
         self._eval_task_interrupt_flag = False
         self.buffer = ''  # input buffer
 
@@ -297,7 +300,7 @@ class Main:
         else:
             return i[0]
 
-    def del_roi(self, index: int):
+    def del_roi(self, index: int, reset_result: bool = None):
         """
         delete roi at index.
 
@@ -305,8 +308,11 @@ class Main:
         ----------
         index
             index of roi.
+        reset_result
+            reset lick possibility which this roi cover. If None, use opt_reset_result_when_del_roi.
 
         """
+
         t, x0, y0, x1, y1 = self.roi[index]
         if index == 0:
             t0 = 0
@@ -322,13 +328,31 @@ class Main:
         LOGGER.info(f'del roi [{t},{x0},{y0},{x1},{y1}]')
 
         # clear result
-        self.lick_possibility[t0:t1] = 0
-        LOGGER.debug(f'clear result from {t0} to {t1}')
-        self._output_file_saved = False
+        if reset_result is None:
+            reset_result = self.opt_reset_result_when_del_roi
 
-    def clear_roi(self):
-        """clear all roi"""
+        if reset_result:
+            self.lick_possibility[t0:t1] = 0
+            LOGGER.debug(f'clear result from {t0} to {t1}')
+            self._output_file_saved = False
+
+    def clear_roi(self, reset_result: bool = None):
+        """
+        clear all roi
+
+        Parameters
+        ----------
+        reset_result
+            reset all lick possibility. If None, use opt_reset_result_when_del_roi.
+
+        """
         self.roi = np.zeros((0, 5), dtype=int)
+
+        if reset_result is None:
+            reset_result = self.opt_reset_result_when_del_roi
+
+        if reset_result:
+            self.clear_result()
 
     def load_roi(self, file: str) -> np.ndarray:
         """
