@@ -610,7 +610,7 @@ class Main:
 
         possibility = self.lick_possibility[f0:f1]
         threshold = self._get_threshold(f0, f1)
-        lick_p = possibility >= threshold
+        lick_p = (possibility >= threshold).astype(int)
         lick_t = np.diff(lick_p)
         return np.count_nonzero(lick_t > 0)
 
@@ -937,7 +937,7 @@ class Main:
 
         # possibility curve
         if f0 != frame:
-            v = self.lick_possibility[f0:frame] >= self._get_threshold(f0, frame)
+            v = (self.lick_possibility[f0:frame] >= self._get_threshold(f0, frame)).astype(int)
             c = np.count_nonzero(np.diff(v) > 0)
             x = np.linspace(s, w - s, duration, dtype=np.int32)
             if len(v) == duration:
