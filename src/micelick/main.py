@@ -1123,6 +1123,8 @@ class Main:
             self.speed_factor *= 2
         elif empty_buffer and k == ord('-'):
             self.speed_factor /= 2
+        elif empty_buffer and k == ord('='):
+            self.speed_factor = 1
         elif k == 13:  # enter:
             command = self.buffer
             self.buffer = ''
@@ -1692,8 +1694,8 @@ class Main:
             self.enqueue_message('cannot jump during evaluation task')
             return
 
-        old_playing = self.is_playing
         frame = self.current_frame + next_n_frame
+        old_eval = self.eval_lick
 
         def _stop(_frame, _value):
             return _value < self.current_threshold
@@ -1707,7 +1709,8 @@ class Main:
             else:
                 self.enqueue_message('jump next lick frame')
                 LOGGER.debug(f'jump to {self.current_frame}, lick possibility {self.current_value}')
-            self.is_playing = old_playing
+
+            self.eval_lick = old_eval
 
         self._eval_result(
             'jump to next lick',
