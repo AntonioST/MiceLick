@@ -156,7 +156,7 @@ class Main:
         vc = self.video_capture
         if vc is None:
             raise RuntimeError()
-        return int(vc.get(cv2.CAP_PROP_POS_FRAMES))
+        return int(vc.get(cv2.CAP_PROP_POS_FRAMES)) - 1
 
     @current_frame.setter
     def current_frame(self, value: int):
@@ -1444,13 +1444,20 @@ class Main:
 
         elif command.startswith('lth'):
             part: List[str] = list(filter(len, command.split(' ')))
+            roi = self.current_roi
             if len(part) == 1:
-                self.enqueue_message(f'threshold {self.lick_threshold}')
+                if roi is not None:
+                    self.enqueue_message(f'threshold {roi[5]}')
+                else:
+                    self.enqueue_message(f'threshold {self.lick_threshold}')
             elif len(part) == 2:
                 value = int(part[1])
                 if value < 0:
                     raise ValueError(f'illegal threshold value : {value}')
                 self.lick_threshold = value
+
+                if roi is not None:
+                    roi[5] = value
             else:
                 raise ValueError(command)
 
